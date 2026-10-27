@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.5.0 — 2026-10-28
+- Add persistent admin controls to turn channel publishing on/off and choose automatic publishing or approval before publishing.
+- Queue prepared stories for admin review when approval mode is selected or publishing is switched off; support approve/publish and reject actions from Telegram inline buttons.
+- Keep news collection and preparation running independently from channel publishing; expose publishing mode in the admin status screen.
+
+
 ## 1.4.2 — 2026-10-28
 - Automatically register the Telegram webhook when missing or pointing to the wrong Worker URL, with a safe force-refresh option on `/health?setupWebhook=1`.
 - Report webhook registration and delivery status from `/health` without exposing bot credentials; preserve queued Telegram updates during registration.
