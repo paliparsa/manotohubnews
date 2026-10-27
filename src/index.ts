@@ -161,6 +161,11 @@ async function runPipeline(env: Env, trigger: string) {
     const revision = stats.filterRevision;
     const unique = new Map<string, NewsItem>();
     for (const item of fetched) {
+      const urlKey = await hashKey(normalizeUrl(item.url));
+      const titleKey = await hashKey(normalizeTitle(item.title));
+      const seenUrl = await stateGet(env, "seen:v" + revision + ":u:" + urlKey);
+      const seenTitle = await stateGet(env, "seen:v" + revision + ":t:" + titleKey);
+      if (seenUrl || seenTitle) continue;
       const searchable = normalizeFilterText(item.title + " " + item.snippet);
       const dateMs = Date.parse(item.publishedAt || "");
       if (settings.maxAgeHours > 0 && Number.isFinite(dateMs) && Date.now() - dateMs > settings.maxAgeHours * 3600000) {
@@ -179,11 +184,6 @@ async function runPipeline(env: Env, trigger: string) {
         await markSeen(env, item, revision); stats.earlyRejected++; countReason("خارج از فهرست کلمات مجاز");
         continue;
       }
-      const urlKey = await hashKey(normalizeUrl(item.url));
-      const titleKey = await hashKey(normalizeTitle(item.title));
-      const seenUrl = await stateGet(env, "seen:v" + revision + ":u:" + urlKey);
-      const seenTitle = await stateGet(env, "seen:v" + revision + ":t:" + titleKey);
-      if (seenUrl || seenTitle) continue;
       unique.set(item.id, item);
     }
     const candidates = [...unique.values()].slice(0, clampInt(env.MAX_ITEMS_PER_RUN, 35, 1, 60));

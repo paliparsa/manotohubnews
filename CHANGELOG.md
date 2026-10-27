@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.7.1 — 2026-10-28
+- Check the active filter-revision seen keys before applying early filters, avoiding repeated writes and inflated rejection counts for already evaluated items.
+
 ## 1.7.0 — 2026-10-28
 - Add Telegram editorial controls for topic categories, allow-list and block-list keywords, filter sensitivity, and maximum news age.
 - Make filter changes versioned so recent feed items can be evaluated again under updated rules without automatically publishing historical items.
