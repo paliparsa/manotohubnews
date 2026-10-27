@@ -63,7 +63,7 @@ export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
-      return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", aiProvider: "OpenRouter", models: MODEL_CATALOG.map(m => m.id) });
+      return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", telegramTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN), adminIdConfigured: Boolean(env.ADMIN_TELEGRAM_ID), encryptionKeyConfigured: Boolean(env.CONFIG_ENCRYPTION_KEY), pollingMode: "cron-getUpdates", aiProvider: "OpenRouter", models: MODEL_CATALOG.map(m => m.id) });
     }
     if (url.pathname === "/telegram-webhook") return json({ ok: false, error: "polling_mode_enabled" }, 409);
     return json({ ok: false, error: "not_found" }, 404);
@@ -342,7 +342,10 @@ function bytesToHex(bytes: Uint8Array) { return [...bytes].map(b => b.toString(1
 function hexToBytes(hex: string) { if (!/^(?:[0-9a-f]{2})+$/i.test(hex)) throw new Error("Invalid encrypted config"); return new Uint8Array(hex.match(/.{2}/g)!.map(x => parseInt(x, 16))); }
 
 async function pollTelegramUpdates(env: Env) {
-  if (!env.TELEGRAM_BOT_TOKEN) return;
+  if (!env.TELEGRAM_BOT_TOKEN) {
+    console.error("telegram_poll_skipped: TELEGRAM_BOT_TOKEN is not configured on this Worker");
+    return;
+  }
   const state = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
   const offset = Number(await stateGet(env, "telegram:update_offset") || "0");
   try {
@@ -351,15 +354,23 @@ async function pollTelegramUpdates(env: Env) {
       const initResponse = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteWebhook`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ drop_pending_updates: false }), signal: AbortSignal.timeout(10000)
       });
-      if (initResponse.ok) await statePutPermanent(env, "telegram:polling_initialized", "1");
+      const initBody: any = await initResponse.json().catch(() => ({}));
+      if (initResponse.ok && initBody.ok) {
+        await statePutPermanent(env, "telegram:polling_initialized", "1");
+      } else {
+        console.warn("telegram_delete_webhook_failed", JSON.stringify({ httpStatus: initResponse.status, description: initBody.description || "no description" }));
+      }
     }
     const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getUpdates`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ offset, timeout: 0, allowed_updates: ["message"] }),
       signal: AbortSignal.timeout(15000)
     });
-    const data: any = await response.json();
-    if (!response.ok || !data.ok || !Array.isArray(data.result)) return;
+    const data: any = await response.json().catch(() => ({}));
+    if (!response.ok || !data.ok || !Array.isArray(data.result)) {
+      console.error("telegram_getupdates_failed", JSON.stringify({ httpStatus: response.status, errorCode: data.error_code || null, description: data.description || "invalid Telegram response" }));
+      return;
+    }
     for (const update of data.result) {
       const nextOffset = Number(update.update_id) + 1;
       try { await handleAdminMessage(env, update.message); }
@@ -456,7 +467,12 @@ async function callOpenRouterTest(key: string, model: string): Promise<{ok: bool
 }
 
 async function telegramReply(env: Env, chatId: number | string, text: string) {
-  await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }) });
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }), signal: AbortSignal.timeout(10000) });
+  const data: any = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) {
+    console.error("telegram_reply_failed", JSON.stringify({ httpStatus: response.status, errorCode: data.error_code || null, description: data.description || "invalid Telegram response" }));
+    throw new Error(`Telegram sendMessage failed: ${data.description || response.status}`);
+  }
 }
 
 async function telegramSend(env: Env, text: string) {
