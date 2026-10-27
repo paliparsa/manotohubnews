@@ -146,6 +146,7 @@ async function runPipeline(env: Env, trigger: string) {
   const state = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
   if (!(await stateCall(state, { op: "acquire", key: lockKey, value: startedAt, ttl: 240 })).ok) return { ok: true, skipped: "another run appears active" };
   let published = 0;
+  let queued = 0;
   let examined = 0;
   try {
     const fetched = await fetchFeeds();
@@ -181,16 +182,25 @@ async function runPipeline(env: Env, trigger: string) {
       const publishedAt = new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran", dateStyle: "medium", timeStyle: "short" });
       const statusLine = post.status === "تأییدشده" ? "✅ <b>تأیید چندمنبعی</b>" : post.status === "گزارش اولیه" ? "⚠️ <b>گزارش اولیه؛ نیازمند پیگیری</b>" : "🔎 <b>در حال بررسی</b>";
       const message = `📰 <b>${escapeHtml(post.headline)}</b>\n\n${escapeHtml(post.summary)}\n\n${statusLine}\n🏷️ <b>حوزه:</b> ${escapeHtml(post.category || "تحولات منطقه") }\n\n<b>منابع:</b>\n${sourceLines}\n\n🕒 <b>زمان انتشار:</b> ${escapeHtml(publishedAt)} (تهران)\n@Manotohubir`;
-      await telegramSend(env, message);
-      await statePut(env, `posted:${postKey}`, JSON.stringify({ at: startedAt, headline: post.headline, supporting: supporting.map(s => s.url) }), 60 * 60 * 24 * 30);
-      published++;
-      // Mark supporting items as seen only after the post has been accepted (or recorded in dry run).
+      const publication = await getPublicationSettings(env);
+      if (publication.enabled && publication.mode === "auto") {
+        await telegramSend(env, message);
+        await statePut(env, `posted:${postKey}`, JSON.stringify({ at: startedAt, headline: post.headline, supporting: supporting.map(s => s.url) }), 60 * 60 * 24 * 30);
+        published++;
+      } else {
+        await statePutPermanent(env, `pending:${postKey}`, JSON.stringify({ postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url) }));
+        if (env.ADMIN_TELEGRAM_ID) {
+          const reason = !publication.enabled ? "انتشار خاموش است؛ پیش‌نویس برای بررسی ذخیره شد." : "منتظر تأیید تو برای انتشار در کانال است.";
+          await telegramReply(env, env.ADMIN_TELEGRAM_ID, `📝 <b>خبر آمادهٔ انتشار</b>\n${escapeHtml(reason)}\n\n${message}`, { inline_keyboard: [[{ text: "✅ تأیید و انتشار", callback_data: `publish:${postKey}` }, { text: "🗑 رد خبر", callback_data: `skip:${postKey}` }]] });
+        }
+        queued++;
+      }
       for (const item of supporting) await markSeen(env, item);
     }
     // Record remaining candidates so they aren't repeatedly sent to the model, but keep a shorter TTL.
     for (const item of candidates) await markSeen(env, item);
-    await statePut(env, "last_run", JSON.stringify({ startedAt, trigger, fetched: fetched.length, examined, published }), 60 * 60 * 24 * 7);
-    return { ok: true, trigger, fetched: fetched.length, examined, published };
+    await statePut(env, "last_run", JSON.stringify({ startedAt, trigger, fetched: fetched.length, examined, published, queued }), 60 * 60 * 24 * 7);
+    return { ok: true, trigger, fetched: fetched.length, examined, published, queued };
   } catch (error) {
     console.error("pipeline_error", error instanceof Error ? error.message : String(error));
     return { ok: false, trigger, examined, published, error: error instanceof Error ? error.message : "unknown error" };
@@ -501,10 +511,28 @@ async function handleAdminMessage(env: Env, message: any) {
 
 function mainMenuKeyboard() {
   return { inline_keyboard: [
-    [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
-    [{ text: "🔌 آزمایش اتصال", callback_data: "menu:test" }, { text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }],
-    [{ text: "🗑 حذف کلید", callback_data: "menu:delkey" }, { text: "🔄 منوی اصلی", callback_data: "menu:home" }]
+    [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "📣 تنظیم انتشار", callback_data: "menu:publishing" }],
+    [{ text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }, { text: "🔌 آزمایش اتصال", callback_data: "menu:test" }],
+    [{ text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }, { text: "🗑 حذف کلید", callback_data: "menu:delkey" }]
   ] };
+}
+
+async function getPublicationSettings(env: Env): Promise<{enabled: boolean; mode: "auto" | "approval"}> {
+  const [enabledRaw, modeRaw] = await Promise.all([stateGet(env, "config:publishing_enabled"), stateGet(env, "config:publishing_mode")]);
+  return { enabled: enabledRaw !== "false", mode: modeRaw === "approval" ? "approval" : "auto" };
+}
+function publishingKeyboard(settings: {enabled: boolean; mode: "auto" | "approval"}) {
+  return { inline_keyboard: [
+    [{ text: settings.enabled ? "🟢 انتشار روشن است — خاموش کن" : "🔴 انتشار خاموش است — روشن کن", callback_data: "publishing:toggle" }],
+    [{ text: settings.mode === "auto" ? "✅ انتشار خودکار (تغییر به تأیید)" : "📝 تأیید قبل از انتشار (تغییر به خودکار)", callback_data: "publishing:mode" }],
+    [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]
+  ] };
+}
+async function sendPublishingSettings(env: Env, chatId: number | string) {
+  const settings = await getPublicationSettings(env);
+  const stateText = settings.enabled ? "🟢 <b>انتشار روشن است</b>" : "🔴 <b>انتشار خاموش است</b>";
+  const modeText = settings.mode === "auto" ? "🤖 حالت: انتشار خودکار" : "📝 حالت: اول تأیید مدیر";
+  await telegramReply(env, chatId, `<b>📣 تنظیمات انتشار خبر</b>\n\n${stateText}\n${modeText}\n\nوقتی انتشار خاموش باشد، خبرهای آماده به‌صورت پیش‌نویس برایت ارسال می‌شوند و در کانال منتشر نمی‌شوند مگر اینکه خودت تأییدشان کنی.`, publishingKeyboard(settings));
 }
 function modelsKeyboard(order: string[]) {
   const rows: Array<Array<{text: string; callback_data: string}>> = order.map((id, i) => [{ text: (i === 0 ? "✅ " : "") + (i + 1) + ". " + (MODEL_CATALOG.find(m => m.id === id)?.name || id), callback_data: "model:" + i }]);
@@ -519,6 +547,28 @@ async function handleAdminCallback(env: Env, query: any) {
   if (!query.id || !chatId) return;
   if (!env.ADMIN_TELEGRAM_ID || fromId !== env.ADMIN_TELEGRAM_ID || query.message?.chat?.type !== "private") { await telegramAnswerCallback(env, query.id, "دسترسی ادمین ندارید"); return; }
   await telegramAnswerCallback(env, query.id);
+  if (data === "menu:publishing") { await sendPublishingSettings(env, chatId); return; }
+  if (data === "publishing:toggle") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_enabled", current.enabled ? "false" : "true"); await sendPublishingSettings(env, chatId); return; }
+  if (data === "publishing:mode") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_mode", current.mode === "auto" ? "approval" : "auto"); await sendPublishingSettings(env, chatId); return; }
+  if (data.startsWith("publish:") || data.startsWith("skip:")) {
+    const approve = data.startsWith("publish:");
+    const postKey = data.slice(approve ? 8 : 5);
+    if (!/^[a-f0-9]{1,64}$/i.test(postKey)) { await telegramReply(env, chatId, "شناسهٔ خبر نامعتبر است.", mainMenuKeyboard()); return; }
+    const raw = await stateGet(env, `pending:${postKey}`);
+    if (!raw) { await telegramReply(env, chatId, "این پیش‌نویس دیگر در صف نیست یا قبلاً بررسی شده است.", mainMenuKeyboard()); return; }
+    let pending: any;
+    try { pending = JSON.parse(raw); } catch { await telegramReply(env, chatId, "اطلاعات پیش‌نویس قابل خواندن نیست.", mainMenuKeyboard()); return; }
+    if (approve) {
+      await telegramSend(env, String(pending.message || ""));
+      await statePut(env, `posted:${postKey}`, JSON.stringify({ at: new Date().toISOString(), headline: pending.headline, supporting: pending.supporting || [], approvedBy: fromId }), 60 * 60 * 24 * 30);
+      await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: `pending:${postKey}` });
+      await telegramReply(env, chatId, `✅ خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» در کانال منتشر شد.`, mainMenuKeyboard());
+    } else {
+      await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: `pending:${postKey}` });
+      await telegramReply(env, chatId, `🗑 خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» رد شد و منتشر نمی‌شود.`, mainMenuKeyboard());
+    }
+    return;
+  }
   if (data === "menu:home") { await telegramReply(env, chatId, "<b>📰 پنل مدیریت خبرخوان</b>\n\nیک گزینه را انتخاب کن.", mainMenuKeyboard()); return; }
   if (data === "menu:status") { const key = await stateGet(env, "config:openrouter_key"); const model = await stateGet(env, "status:last_model") || "هنوز استفاده نشده"; const order = await getModelOrder(env); await telegramReply(env, chatId, "<b>📊 وضعیت سیستم</b>\n\n🟢 Worker: فعال\n📣 کانال: " + escapeHtml(env.CHANNEL_ID || "@Manotohubir") + "\n🔐 OpenRouter: " + (key ? "ثبت و رمزگذاری شده" : "ثبت نشده") + "\n🧠 مدل اصلی: <code>" + escapeHtml(order[0]) + "</code>\n🕘 آخرین مدل موفق: <code>" + escapeHtml(model) + "</code>\n⏱ انتشار خودکار: هر ۵ دقیقه", mainMenuKeyboard()); return; }
   if (data === "menu:models") { const order = await getModelOrder(env); await telegramReply(env, chatId, "<b>🧠 انتخاب مدل اصلی</b>\n\nروی مدل دلخواه بزن؛ بقیه مدل‌ها به‌عنوان پشتیبان حفظ می‌شوند.", modelsKeyboard(order)); return; }
