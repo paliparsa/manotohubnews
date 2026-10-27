@@ -63,7 +63,11 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
-      return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", telegramTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN), adminIdConfigured: Boolean(env.ADMIN_TELEGRAM_ID), encryptionKeyConfigured: Boolean(env.CONFIG_ENCRYPTION_KEY), telegramMode: "webhook", webhookSecretConfigured: Boolean(env.TELEGRAM_WEBHOOK_SECRET), aiProvider: "OpenRouter", models: MODEL_CATALOG.map(m => m.id) });
+      // A code deployment alone does not register a Telegram webhook. Make health checks
+      // self-healing: register the expected endpoint if missing/wrong, or force-refresh
+      // when explicitly requested with ?setupWebhook=1. Never expose the bot token/secret.
+      const webhook = await ensureTelegramWebhook(request.url, env, url.searchParams.get("setupWebhook") === "1");
+      return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", telegramTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN), adminIdConfigured: Boolean(env.ADMIN_TELEGRAM_ID), encryptionKeyConfigured: Boolean(env.CONFIG_ENCRYPTION_KEY), telegramMode: "webhook", webhookSecretConfigured: Boolean(env.TELEGRAM_WEBHOOK_SECRET), webhook, aiProvider: "OpenRouter", models: MODEL_CATALOG.map(m => m.id) });
     }
     if (url.pathname === "/telegram-webhook") {
       if (request.method !== "POST") return json({ ok: false, error: "method_not_allowed" }, 405);
@@ -79,6 +83,62 @@ export default {
     return json({ ok: false, error: "not_found" }, 404);
   }
 };
+
+async function ensureTelegramWebhook(requestUrl: string, env: Env, force: boolean): Promise<Record<string, unknown>> {
+  if (!env.TELEGRAM_BOT_TOKEN) return { ok: false, configured: false, error: "telegram_token_missing" };
+  if (!env.TELEGRAM_WEBHOOK_SECRET) return { ok: false, configured: false, error: "webhook_secret_missing" };
+  if (!/^[A-Za-z0-9_-]{1,256}$/.test(env.TELEGRAM_WEBHOOK_SECRET)) {
+    return { ok: false, configured: false, error: "webhook_secret_invalid_format" };
+  }
+
+  const targetUrl = new URL("/telegram-webhook", requestUrl).toString();
+  try {
+    const infoResponse = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/getWebhookInfo", {
+      method: "POST",
+      signal: AbortSignal.timeout(8000)
+    });
+    const info: any = await infoResponse.json().catch(() => ({}));
+    if (!infoResponse.ok || !info.ok) {
+      return { ok: false, configured: false, error: "get_webhook_info_failed", telegramStatus: info.error_code || infoResponse.status };
+    }
+
+    const currentUrl = String(info.result?.url || "");
+    if (!force && currentUrl === targetUrl) {
+      return {
+        ok: true,
+        configured: true,
+        action: "already_configured",
+        pendingUpdates: Number(info.result?.pending_update_count || 0),
+        ...(info.result?.last_error_message ? { lastDeliveryError: String(info.result.last_error_message).slice(0, 240) } : {})
+      };
+    }
+
+    const setResponse = await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/setWebhook", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        url: targetUrl,
+        secret_token: env.TELEGRAM_WEBHOOK_SECRET,
+        allowed_updates: ["message", "callback_query"],
+        drop_pending_updates: false
+      }),
+      signal: AbortSignal.timeout(10000)
+    });
+    const setResult: any = await setResponse.json().catch(() => ({}));
+    if (!setResponse.ok || !setResult.ok) {
+      console.error("telegram_webhook_registration_failed", JSON.stringify({
+        httpStatus: setResponse.status,
+        errorCode: setResult.error_code || null,
+        description: String(setResult.description || "invalid Telegram response").slice(0, 240)
+      }));
+      return { ok: false, configured: false, error: "set_webhook_failed", telegramStatus: setResult.error_code || setResponse.status };
+    }
+    return { ok: true, configured: true, action: force ? "registered_by_request" : "auto_registered", pendingUpdates: Number(info.result?.pending_update_count || 0) };
+  } catch (error) {
+    console.error("telegram_webhook_registration_error", error instanceof Error ? error.message : String(error));
+    return { ok: false, configured: false, error: "telegram_api_unreachable" };
+  }
+}
 
 async function runPipeline(env: Env, trigger: string) {
   const startedAt = new Date().toISOString();
