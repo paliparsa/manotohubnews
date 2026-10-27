@@ -202,30 +202,30 @@ async function runPipeline(env: Env, trigger: string) {
       const supporting = candidates.filter(x => post.supportingIds.includes(x.id));
       const topicId = EDITORIAL_TOPICS.some(t => t.id === post.topic) ? String(post.topic) : topicFromText(post.category + " " + post.headline + " " + post.summary);
       if (!settings.topics.includes(topicId)) {
-        for (const item of supporting) { await recordRejected(env, item, "topic_disabled", "حوزه غیرفعال: " + topicId, revision); countReason("حوزه غیرفعال"); }
+        for (const item of supporting) { await recordRejected(env, item, "topic_disabled", "حوزه غیرفعال: " + topicId, revision); await markSeen(env, item, revision); handled.add(item.id); countReason("حوزه غیرفعال"); }
         continue;
       }
       if (!post.relevant || !post.headline || !post.summary) {
-        for (const item of supporting) { await recordRejected(env, item, "ai_not_relevant", post.reason || "مدل خبر را مرتبط تشخیص نداد", revision); countReason("نامرتبط از نظر AI"); }
+        for (const item of supporting) { await recordRejected(env, item, "ai_not_relevant", post.reason || "مدل خبر را مرتبط تشخیص نداد", revision); await markSeen(env, item, revision); handled.add(item.id); countReason("نامرتبط از نظر AI"); }
         continue;
       }
       if (post.confidence < minConfidence) {
-        for (const item of supporting) { await recordRejected(env, item, "low_confidence", "اطمینان " + post.confidence + " کمتر از آستانه " + minConfidence, revision); countReason("اطمینان پایین"); }
+        for (const item of supporting) { await recordRejected(env, item, "low_confidence", "اطمینان " + post.confidence + " کمتر از آستانه " + minConfidence, revision); await markSeen(env, item, revision); handled.add(item.id); countReason("اطمینان پایین"); }
         continue;
       }
       const domains = new Set(supporting.map(x => x.domain).filter(Boolean));
       if (supporting.length === 0) { countReason("بدون منبع پشتیبان معتبر"); continue; }
       if (domains.size < 2 && post.status === "تأییدشده") {
-        for (const item of supporting) { await recordRejected(env, item, "insufficient_sources", "تأیید چندمنبعی بدون دو دامنه مستقل ممکن نیست", revision); countReason("منابع ناکافی"); }
+        for (const item of supporting) { await recordRejected(env, item, "insufficient_sources", "تأیید چندمنبعی بدون دو دامنه مستقل ممکن نیست", revision); await markSeen(env, item, revision); handled.add(item.id); countReason("منابع ناکافی"); }
         continue;
       }
       if (stats.published + stats.queued >= maxPosts) {
-        for (const item of supporting) { await recordRejected(env, item, "run_limit", "سقف خبرهای این اجرا پر شده است", revision); countReason("سقف اجرا"); }
+        for (const item of supporting) { await recordRejected(env, item, "run_limit", "سقف خبرهای این اجرا پر شده است", revision); await markSeen(env, item, revision); handled.add(item.id); countReason("سقف اجرا"); }
         continue;
       }
       const postKey = await hashKey(normalizeTitle(post.headline));
       if (await stateGet(env, "posted:" + postKey)) {
-        for (const item of supporting) { handled.add(item.id); await recordRejected(env, item, "duplicate_post", "تیتر مشابه قبلاً منتشر شده است", revision); countReason("تکراری"); }
+        for (const item of supporting) { handled.add(item.id); await recordRejected(env, item, "duplicate_post", "تیتر مشابه قبلاً منتشر شده است", revision); await markSeen(env, item, revision); countReason("تکراری"); }
         continue;
       }
       const sourceLines = supporting.slice(0, 4).map(s => "• <a href=\"" + escapeAttr(s.url) + "\">" + escapeHtml(s.source || s.domain) + "</a>").join("\n");
