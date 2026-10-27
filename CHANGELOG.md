@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.6.0 — 2026-10-28
+- Add admin source management for listing configured RSS/Atom feeds, enabling/disabling sources, and deleting sources with confirmation.
+- Allow admins to add public RSS/Atom feed URLs with optional language tags; validate feed URLs before saving.
+- Persist source configuration in Durable Object storage and retain the existing default source list on first initialization.
+
+
 ## 1.5.0 — 2026-10-28
 - Add persistent admin controls to turn channel publishing on/off and choose automatic publishing or approval before publishing.
 - Queue prepared stories for admin review when approval mode is selected or publishing is switched off; support approve/publish and reject actions from Telegram inline buttons.

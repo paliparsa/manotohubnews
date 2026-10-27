@@ -31,7 +31,7 @@ interface AiPost {
   category: string;
 }
 
-const FEEDS: Array<{ url: string; language: string }> = [
+const DEFAULT_FEEDS: Array<{ url: string; language: string }> = [
   { url: "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml", language: "en" },
   { url: "https://www.aljazeera.com/xml/rss/all.xml", language: "en/ar" },
   { url: "https://news.google.com/rss/search?q=(Iran+OR+Iranian+OR+Tehran)+AND+(Israel+OR+United+States+OR+US+OR+Trump)+when:2d&hl=en-US&gl=US&ceid=US:en", language: "en" },
@@ -149,7 +149,7 @@ async function runPipeline(env: Env, trigger: string) {
   let queued = 0;
   let examined = 0;
   try {
-    const fetched = await fetchFeeds();
+    const fetched = await fetchFeeds(env);
     const unique = new Map<string, NewsItem>();
     for (const item of fetched) {
       const urlKey = await hashKey(normalizeUrl(item.url));
@@ -268,9 +268,29 @@ export class NewsState {
   }
 }
 
-async function fetchFeeds(): Promise<NewsItem[]> {
-  const results = await Promise.allSettled(FEEDS.map(async feed => {
-    const response = await fetch(feed.url, { headers: { "user-agent": "ManotohubirNewsBot/1.0 (RSS reader)", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(12000) });
+type FeedSource = { id: string; url: string; language: string; enabled: boolean };
+
+async function getFeedSources(env: Env): Promise<FeedSource[]> {
+  const raw = await stateGet(env, "config:feed_sources");
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.filter((x: any) => x && typeof x.id === "string" && typeof x.url === "string" && typeof x.language === "string" && typeof x.enabled === "boolean").slice(0, 100);
+    } catch {}
+  }
+  const initial = DEFAULT_FEEDS.map(feed => ({ id: simpleHash(feed.url), url: feed.url, language: feed.language, enabled: true }));
+  await statePutPermanent(env, "config:feed_sources", JSON.stringify(initial));
+  return initial;
+}
+
+async function saveFeedSources(env: Env, sources: FeedSource[]): Promise<void> {
+  await statePutPermanent(env, "config:feed_sources", JSON.stringify(sources.slice(0, 100)));
+}
+
+async function fetchFeeds(env: Env): Promise<NewsItem[]> {
+  const sources = (await getFeedSources(env)).filter(feed => feed.enabled);
+  const results = await Promise.allSettled(sources.map(async feed => {
+    const response = await fetch(feed.url, { headers: { "user-agent": "ManotohubirNewsBot/1.0 (RSS reader)", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(12000), redirect: "follow" });
     if (!response.ok) throw new Error(`Feed ${new URL(feed.url).hostname} returned ${response.status}`);
     const xml = await response.text();
     return parseFeed(xml, feed.language);
@@ -448,6 +468,16 @@ async function handleAdminMessage(env: Env, message: any) {
     }
     return;
   }
+  if (/^\\/cancel(?:@\\w+)?$/i.test(text)) {
+    await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "telegram:awaiting_feed_url:" + fromId });
+    await telegramReply(env, chatId, "لغو شد.", mainMenuKeyboard());
+    return;
+  }
+  const awaitingFeedKey = "telegram:awaiting_feed_url:" + fromId;
+  if (!text.startsWith("/") && await stateGet(env, awaitingFeedKey) === "1") {
+    await addFeedSourceFromMessage(env, chatId, fromId, text);
+    return;
+  }
   const awaitingKeyKey = "telegram:awaiting_openrouter_key:" + fromId;
   if (!text.startsWith("/") && await stateGet(env, awaitingKeyKey) === "1") {
     try { await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/deleteMessage", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: chatId, message_id: message.message_id }) }); } catch {}
@@ -512,9 +542,74 @@ async function handleAdminMessage(env: Env, message: any) {
 function mainMenuKeyboard() {
   return { inline_keyboard: [
     [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "📣 تنظیم انتشار", callback_data: "menu:publishing" }],
-    [{ text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }, { text: "🔌 آزمایش اتصال", callback_data: "menu:test" }],
-    [{ text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }, { text: "🗑 حذف کلید", callback_data: "menu:delkey" }]
+    [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
+    [{ text: "🔌 آزمایش اتصال", callback_data: "menu:test" }, { text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }],
+    [{ text: "🗑 حذف کلید", callback_data: "menu:delkey" }]
   ] };
+}
+
+async function sendSourcesMenu(env: Env, chatId: number | string, page = 0) {
+  const sources = await getFeedSources(env);
+  const pageSize = 8;
+  const maxPage = Math.max(0, Math.ceil(sources.length / pageSize) - 1);
+  const currentPage = Math.max(0, Math.min(maxPage, page));
+  const visible = sources.slice(currentPage * pageSize, currentPage * pageSize + pageSize);
+  const rows: Array<Array<{text: string; callback_data: string}>> = visible.map(source => {
+    let host = source.url;
+    try { host = new URL(source.url).hostname.replace(/^www\./, ""); } catch {}
+    return [
+      { text: (source.enabled ? "🟢 " : "⚫ ") + host.slice(0, 24), callback_data: "source:toggle:" + source.id },
+      { text: source.enabled ? "⏸" : "▶️", callback_data: "source:toggle:" + source.id },
+      { text: "🗑", callback_data: "source:delete:" + source.id }
+    ];
+  });
+  rows.push([{ text: "➕ افزودن منبع RSS/Atom", callback_data: "source:add" }]);
+  const nav: Array<{text: string; callback_data: string}> = [];
+  if (currentPage > 0) nav.push({ text: "⬅️ قبلی", callback_data: "source:list:" + (currentPage - 1) });
+  if (currentPage < maxPage) nav.push({ text: "بعدی ➡️", callback_data: "source:list:" + (currentPage + 1) });
+  if (nav.length) rows.push(nav);
+  rows.push([{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]);
+  const active = sources.filter(x => x.enabled).length;
+  const lines = visible.map((source, i) => `${currentPage * pageSize + i + 1}. ${source.enabled ? "🟢 فعال" : "⚫ غیرفعال"} — <code>${escapeHtml(source.url.slice(0, 170))}</code> [${escapeHtml(source.language)}]`);
+  await telegramReply(env, chatId, `<b>🗂 مدیریت منابع خبر</b>\n\nکل منابع: ${sources.length} | فعال: ${active}\nبرای روشن/خاموش کردن روی نام یا دکمهٔ وضعیت بزن؛ 🗑 برای حذف.\n\n${lines.join("\n") || "هنوز منبعی ثبت نشده."}`, { inline_keyboard: rows });
+}
+
+async function addFeedSourceFromMessage(env: Env, chatId: number | string, fromId: string, rawInput: string) {
+  const parts = rawInput.split("|").map(x => x.trim());
+  const urlText = parts[0] || "";
+  const language = (parts[1] || "fa").toLowerCase();
+  if (urlText.length > 500 || !/^https?:\/\//i.test(urlText) || !/^(fa|en|ar|he|tr|fr|de|ru|en\/ar)$/.test(language)) {
+    await telegramReply(env, chatId, "فرمت درست نیست. فقط لینک RSS/Atom با http یا https بفرست. زبان اختیاری است: fa, en, ar, he, tr, fr, de, ru.\nمثال: <code>https://example.com/rss.xml | fa</code>", mainMenuKeyboard());
+    return;
+  }
+  let parsed: URL;
+  try { parsed = new URL(urlText); } catch { await telegramReply(env, chatId, "آدرس URL معتبر نیست."); return; }
+  if (parsed.username || parsed.password || parsed.hostname === "localhost" || parsed.hostname.endsWith(".local") || parsed.hostname.endsWith(".internal") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(parsed.hostname) || parsed.hostname.includes(":")) {
+    await telegramReply(env, chatId, "این آدرس قابل قبول نیست؛ از یک دامنهٔ عمومی با RSS/Atom استفاده کن.", mainMenuKeyboard());
+    return;
+  }
+  const sources = await getFeedSources(env);
+  if (sources.some(source => source.url === parsed.toString() || source.url === urlText)) {
+    await telegramReply(env, chatId, "این منبع قبلاً ثبت شده است.", mainMenuKeyboard());
+    await sendSourcesMenu(env, chatId);
+    return;
+  }
+  if (sources.length >= 100) { await telegramReply(env, chatId, "حداکثر ۱۰۰ منبع قابل ثبت است.", mainMenuKeyboard()); return; }
+  try {
+    const response = await fetch(parsed.toString(), { headers: { "user-agent": "ManotohubirNewsBot/1.0 (RSS reader)", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(10000), redirect: "follow" });
+    if (!response.ok) { await telegramReply(env, chatId, `دریافت منبع ناموفق بود: HTTP ${response.status}. لینک RSS/Atom را بررسی کن.`, mainMenuKeyboard()); return; }
+    const xml = await response.text();
+    if (!/<(?:rss|feed|rdf:RDF|item|entry)(?:\s|>)/i.test(xml)) { await telegramReply(env, chatId, "این آدرس شبیه فید RSS/Atom نیست؛ لینک مستقیم فید را بفرست.", mainMenuKeyboard()); return; }
+  } catch (e) {
+    await telegramReply(env, chatId, "به فید دسترسی پیدا نکردم یا زمان اتصال تمام شد. لینک RSS/Atom دیگری امتحان کن.", mainMenuKeyboard());
+    return;
+  }
+  const id = simpleHash(parsed.toString());
+  sources.push({ id, url: parsed.toString(), language, enabled: true });
+  await saveFeedSources(env, sources);
+  await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "telegram:awaiting_feed_url:" + fromId });
+  await telegramReply(env, chatId, "✅ منبع اضافه و فعال شد. از اجرای بعدی وارد بررسی خبرها می‌شود.", mainMenuKeyboard());
+  await sendSourcesMenu(env, chatId);
 }
 
 async function getPublicationSettings(env: Env): Promise<{enabled: boolean; mode: "auto" | "approval"}> {
@@ -547,6 +642,40 @@ async function handleAdminCallback(env: Env, query: any) {
   if (!query.id || !chatId) return;
   if (!env.ADMIN_TELEGRAM_ID || fromId !== env.ADMIN_TELEGRAM_ID || query.message?.chat?.type !== "private") { await telegramAnswerCallback(env, query.id, "دسترسی ادمین ندارید"); return; }
   await telegramAnswerCallback(env, query.id);
+  if (data === "menu:sources") { await sendSourcesMenu(env, chatId); return; }
+  if (data === "source:add") { await statePutPermanent(env, "telegram:awaiting_feed_url:" + fromId, "1"); await telegramReply(env, chatId, "➕ <b>افزودن منبع خبر</b>\n\nلینک مستقیم RSS/Atom را بفرست. زبان اختیاری است و اگر ننویسی fa در نظر گرفته می‌شود.\n\nمثال:\n<code>https://example.com/rss.xml | fa</code>\n\nبرای لغو، /cancel را بفرست."); return; }
+  if (data.startsWith("source:list:")) { await sendSourcesMenu(env, chatId, Number(data.slice("source:list:".length)) || 0); return; }
+  if (data.startsWith("source:toggle:")) {
+    const id = data.slice("source:toggle:".length);
+    const sources = await getFeedSources(env);
+    const source = sources.find(item => item.id === id);
+    if (!source) { await telegramReply(env, chatId, "این منبع پیدا نشد.", mainMenuKeyboard()); return; }
+    source.enabled = !source.enabled;
+    await saveFeedSources(env, sources);
+    await sendSourcesMenu(env, chatId);
+    return;
+  }
+  if (data.startsWith("source:delete:")) {
+    const id = data.slice("source:delete:".length);
+    const sources = await getFeedSources(env);
+    const source = sources.find(item => item.id === id);
+    if (!source) { await telegramReply(env, chatId, "این منبع پیدا نشد.", mainMenuKeyboard()); return; }
+    await statePutPermanent(env, "telegram:pending_source_delete:" + fromId, id);
+    await telegramReply(env, chatId, "🗑 <b>حذف منبع؟</b>\n\n<code>" + escapeHtml(source.url.slice(0, 220)) + "</code>\n\nاین کار قابل بازگشت خودکار نیست.", { inline_keyboard: [[{ text: "🗑 بله، حذف شود", callback_data: "source:confirmdelete:" + id }], [{ text: "لغو", callback_data: "menu:sources" }]] });
+    return;
+  }
+  if (data.startsWith("source:confirmdelete:")) {
+    const id = data.slice("source:confirmdelete:".length);
+    const pendingId = await stateGet(env, "telegram:pending_source_delete:" + fromId);
+    if (!pendingId || pendingId !== id) { await telegramReply(env, chatId, "درخواست حذف معتبر نیست؛ فهرست منابع را دوباره باز کن.", mainMenuKeyboard()); return; }
+    const sources = await getFeedSources(env);
+    const updated = sources.filter(item => item.id !== id);
+    if (updated.length === sources.length) { await telegramReply(env, chatId, "این منبع قبلاً حذف شده است.", mainMenuKeyboard()); return; }
+    await saveFeedSources(env, updated);
+    await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "telegram:pending_source_delete:" + fromId });
+    await sendSourcesMenu(env, chatId);
+    return;
+  }
   if (data === "menu:publishing") { await sendPublishingSettings(env, chatId); return; }
   if (data === "publishing:toggle") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_enabled", current.enabled ? "false" : "true"); await sendPublishingSettings(env, chatId); return; }
   if (data === "publishing:mode") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_mode", current.mode === "auto" ? "approval" : "auto"); await sendPublishingSettings(env, chatId); return; }
