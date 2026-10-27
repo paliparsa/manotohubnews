@@ -1,0 +1,25 @@
+name = "manotohubir-news"
+main = "src/index.ts"
+compatibility_date = "2026-10-28"
+workers_dev = true
+
+[observability]
+enabled = true
+
+[triggers]
+# Poll Telegram admin commands every minute; news feed pipeline runs every five minutes.
+crons = ["* * * * *"]
+
+[[durable_objects.bindings]]
+name = "NEWS_STATE"
+class_name = "NewsState"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["NewsState"]
+
+[vars]
+CHANNEL_ID = "@Manotohubir"
+MAX_ITEMS_PER_RUN = "35"
+MAX_POSTS_PER_RUN = "4"
+MIN_CONFIDENCE = "0.78"
