@@ -1,6 +1,7 @@
 interface Env {
   NEWS_STATE: DurableObjectNamespace;
   TELEGRAM_BOT_TOKEN: string;
+  TELEGRAM_WEBHOOK_SECRET: string;
   ADMIN_TELEGRAM_ID: string;
   CONFIG_ENCRYPTION_KEY: string;
   CHANNEL_ID: string;
@@ -55,17 +56,26 @@ const SYSTEM_PROMPT = `تو دبیر خبر یک کانال فارسی‌زبا�
 
 export default {
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    // Telegram admin commands are polled every minute. News pipeline runs every five minutes.
-    ctx.waitUntil(pollTelegramUpdates(env));
+    // Telegram updates arrive instantly through the webhook; Cron is only for news publishing.
     const minute = new Date(controller.scheduledTime).getUTCMinutes();
     if (minute % 5 === 0) ctx.waitUntil(runPipeline(env, "cron"));
   },
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
-      return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", telegramTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN), adminIdConfigured: Boolean(env.ADMIN_TELEGRAM_ID), encryptionKeyConfigured: Boolean(env.CONFIG_ENCRYPTION_KEY), pollingMode: "cron-getUpdates", aiProvider: "OpenRouter", models: MODEL_CATALOG.map(m => m.id) });
+      return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", telegramTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN), adminIdConfigured: Boolean(env.ADMIN_TELEGRAM_ID), encryptionKeyConfigured: Boolean(env.CONFIG_ENCRYPTION_KEY), telegramMode: "webhook", webhookSecretConfigured: Boolean(env.TELEGRAM_WEBHOOK_SECRET), aiProvider: "OpenRouter", models: MODEL_CATALOG.map(m => m.id) });
     }
-    if (url.pathname === "/telegram-webhook") return json({ ok: false, error: "polling_mode_enabled" }, 409);
+    if (url.pathname === "/telegram-webhook") {
+      if (request.method !== "POST") return json({ ok: false, error: "method_not_allowed" }, 405);
+      if (!env.TELEGRAM_WEBHOOK_SECRET) return json({ ok: false, error: "webhook_secret_not_configured" }, 503);
+      const suppliedSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token") || "";
+      if (suppliedSecret !== env.TELEGRAM_WEBHOOK_SECRET) return json({ ok: false, error: "unauthorized" }, 401);
+      let update: any;
+      try { update = await request.json(); } catch { return json({ ok: false, error: "invalid_json" }, 400); }
+      if (!update || typeof update.update_id !== "number") return json({ ok: false, error: "invalid_update" }, 400);
+      ctx.waitUntil(processTelegramUpdate(update, env));
+      return json({ ok: true, received: true });
+    }
     return json({ ok: false, error: "not_found" }, 404);
   }
 };
@@ -341,43 +351,16 @@ async function deriveConfigKey(env: Env): Promise<CryptoKey> {
 function bytesToHex(bytes: Uint8Array) { return [...bytes].map(b => b.toString(16).padStart(2, "0")).join(""); }
 function hexToBytes(hex: string) { if (!/^(?:[0-9a-f]{2})+$/i.test(hex)) throw new Error("Invalid encrypted config"); return new Uint8Array(hex.match(/.{2}/g)!.map(x => parseInt(x, 16))); }
 
-async function pollTelegramUpdates(env: Env) {
-  if (!env.TELEGRAM_BOT_TOKEN) {
-    console.error("telegram_poll_skipped: TELEGRAM_BOT_TOKEN is not configured on this Worker");
-    return;
-  }
-  const state = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
-  const offset = Number(await stateGet(env, "telegram:update_offset") || "0");
+async function processTelegramUpdate(update: any, env: Env) {
   try {
-    // This project uses polling. Remove an old webhook once, preserving pending updates.
-    if (!(await stateGet(env, "telegram:polling_initialized"))) {
-      const initResponse = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/deleteWebhook`, {
-        method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ drop_pending_updates: false }), signal: AbortSignal.timeout(10000)
-      });
-      const initBody: any = await initResponse.json().catch(() => ({}));
-      if (initResponse.ok && initBody.ok) {
-        await statePutPermanent(env, "telegram:polling_initialized", "1");
-      } else {
-        console.warn("telegram_delete_webhook_failed", JSON.stringify({ httpStatus: initResponse.status, description: initBody.description || "no description" }));
-      }
-    }
-    const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getUpdates`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ offset, timeout: 0, allowed_updates: ["message", "callback_query"] }),
-      signal: AbortSignal.timeout(15000)
-    });
-    const data: any = await response.json().catch(() => ({}));
-    if (!response.ok || !data.ok || !Array.isArray(data.result)) {
-      console.error("telegram_getupdates_failed", JSON.stringify({ httpStatus: response.status, errorCode: data.error_code || null, description: data.description || "invalid Telegram response" }));
-      return;
-    }
-    for (const update of data.result) {
-      const nextOffset = Number(update.update_id) + 1;
-      try { if (update.callback_query) await handleAdminCallback(env, update.callback_query); else await handleAdminMessage(env, update.message); }
-      catch (e) { console.error("admin_interaction_error", e instanceof Error ? e.message : "error"); }
-      await statePutPermanent(env, "telegram:update_offset", String(nextOffset));
-    }
-  } catch (e) { console.warn("telegram_poll_error", e instanceof Error ? e.message : "error"); }
+    if (update.callback_query) await handleAdminCallback(env, update.callback_query);
+    else if (update.message) await handleAdminMessage(env, update.message);
+  } catch (e) {
+    console.error("telegram_webhook_update_error", JSON.stringify({
+      updateId: update.update_id,
+      error: e instanceof Error ? e.message : String(e)
+    }));
+  }
 }
 
 async function handleAdminMessage(env: Env, message: any) {
