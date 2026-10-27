@@ -60,7 +60,7 @@ export default {
     const minute = new Date(controller.scheduledTime).getUTCMinutes();
     if (minute % 5 === 0) ctx.waitUntil(runPipeline(env, "cron"));
   },
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname === "/health") {
       return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", telegramTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN), adminIdConfigured: Boolean(env.ADMIN_TELEGRAM_ID), encryptionKeyConfigured: Boolean(env.CONFIG_ENCRYPTION_KEY), telegramMode: "webhook", webhookSecretConfigured: Boolean(env.TELEGRAM_WEBHOOK_SECRET), aiProvider: "OpenRouter", models: MODEL_CATALOG.map(m => m.id) });
