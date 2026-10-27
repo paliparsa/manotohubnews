@@ -280,7 +280,7 @@ async function runPipeline(env: Env, trigger: string) {
   }
 }
 
-async function stateCall(async function stateCall(stub: DurableObjectStub, body: Record<string, unknown>): Promise<any> {
+async function stateCall(stub: DurableObjectStub, body: Record<string, unknown>): Promise<any> {
   const response = await stub.fetch("https://state.internal/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(`State store failed: ${response.status}`);
   return response.json();
@@ -551,7 +551,7 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
     "خروجی فقط یک آرایه JSON معتبر باشد، بدون Markdown و بدون متن قبل یا بعد از JSON. هر آیتم باید این کلیدها را داشته باشد: relevant(boolean), headline(string), summary(string), status(یکی از «تأییدشده»، «گزارش اولیه»، «در حال بررسی»), confidence(number بین 0 و 1), supportingIds(array از idها), reason(string), category(string), topic(string از شناسه‌های مجاز).",
     JSON.stringify(payload)
   ].join("\n");
-  const errors: string[] = [];  const errors: string[] = [];
+  const errors: string[] = [];
   for (const model of models) {
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
