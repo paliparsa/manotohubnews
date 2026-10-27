@@ -363,7 +363,7 @@ async function pollTelegramUpdates(env: Env) {
     }
     const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getUpdates`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ offset, timeout: 0, allowed_updates: ["message"] }),
+      body: JSON.stringify({ offset, timeout: 0, allowed_updates: ["message", "callback_query"] }),
       signal: AbortSignal.timeout(15000)
     });
     const data: any = await response.json().catch(() => ({}));
@@ -373,8 +373,8 @@ async function pollTelegramUpdates(env: Env) {
     }
     for (const update of data.result) {
       const nextOffset = Number(update.update_id) + 1;
-      try { await handleAdminMessage(env, update.message); }
-      catch (e) { console.error("admin_command_error", e instanceof Error ? e.message : "error"); }
+      try { if (update.callback_query) await handleAdminCallback(env, update.callback_query); else await handleAdminMessage(env, update.message); }
+      catch (e) { console.error("admin_interaction_error", e instanceof Error ? e.message : "error"); }
       await statePutPermanent(env, "telegram:update_offset", String(nextOffset));
     }
   } catch (e) { console.warn("telegram_poll_error", e instanceof Error ? e.message : "error"); }
@@ -395,8 +395,18 @@ async function handleAdminMessage(env: Env, message: any) {
     }
     return;
   }
+  const awaitingKeyKey = "telegram:awaiting_openrouter_key:" + fromId;
+  if (!text.startsWith("/") && await stateGet(env, awaitingKeyKey) === "1") {
+    try { await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/deleteMessage", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: chatId, message_id: message.message_id }) }); } catch {}
+    await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: awaitingKeyKey });
+    if (!/^sk-or-v1-[A-Za-z0-9_-]{20,}$/.test(text)) { await telegramReply(env, chatId, "فرمت کلید درست نیست. دوباره از دکمهٔ ثبت کلید شروع کن.", mainMenuKeyboard()); return; }
+    await storeOpenRouterKey(env, text);
+    await telegramReply(env, chatId, "✅ کلید OpenRouter ثبت و رمزگذاری شد.", mainMenuKeyboard());
+    return;
+  }
+
   if (/^\/start(?:@\w+)?$/.test(text) || /^\/help(?:@\w+)?$/.test(text)) {
-    await telegramReply(env, chatId, "پنل مدیریت خبرخوان @Manotohubir\n/status — وضعیت سیستم\n/models — مدل‌ها و ترتیب fallback\n/setmodel 1-4 — تغییر مدل اصلی\n/setkey YOUR_OPENROUTER_KEY — ثبت کلید OpenRouter (در چت خصوصی)\n/delkey — حذف کلید\n/test — آزمایش اتصال به مدل فعال\n\nکلید ارسالی با AES-GCM رمزگذاری می‌شود و در Durable Objects ذخیره می‌شود. کلید را فقط در چت خصوصی همین ربات بفرست.");
+    await telegramReply(env, chatId, "📰 <b>پنل مدیریت خبرخوان</b>\n\nاز دکمه‌های زیر برای مدیریت ربات استفاده کن.\n\n🔐 کلید OpenRouter فقط در گفت‌وگوی خصوصی ثبت و رمزگذاری می‌شود.", mainMenuKeyboard());
     return;
   }
   if (/^\/status(?:@\w+)?$/.test(text)) {
@@ -446,6 +456,37 @@ async function handleAdminMessage(env: Env, message: any) {
   }
 }
 
+function mainMenuKeyboard() {
+  return { inline_keyboard: [
+    [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
+    [{ text: "🔌 آزمایش اتصال", callback_data: "menu:test" }, { text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }],
+    [{ text: "🗑 حذف کلید", callback_data: "menu:delkey" }, { text: "🔄 منوی اصلی", callback_data: "menu:home" }]
+  ] };
+}
+function modelsKeyboard(order: string[]) {
+  const rows: Array<Array<{text: string; callback_data: string}>> = order.map((id, i) => [{ text: (i === 0 ? "✅ " : "") + (i + 1) + ". " + (MODEL_CATALOG.find(m => m.id === id)?.name || id), callback_data: "model:" + i }]);
+  rows.push([{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]);
+  return { inline_keyboard: rows };
+}
+async function telegramAnswerCallback(env: Env, callbackId: string, text = "") {
+  try { await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/answerCallbackQuery", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ callback_query_id: callbackId, text: text.slice(0, 180) }), signal: AbortSignal.timeout(8000) }); } catch {}
+}
+async function handleAdminCallback(env: Env, query: any) {
+  const fromId = String(query.from?.id ?? ""); const chatId = query.message?.chat?.id; const data = String(query.data || "");
+  if (!query.id || !chatId) return;
+  if (!env.ADMIN_TELEGRAM_ID || fromId !== env.ADMIN_TELEGRAM_ID || query.message?.chat?.type !== "private") { await telegramAnswerCallback(env, query.id, "دسترسی ادمین ندارید"); return; }
+  await telegramAnswerCallback(env, query.id);
+  if (data === "menu:home") { await telegramReply(env, chatId, "<b>📰 پنل مدیریت خبرخوان</b>\n\nیک گزینه را انتخاب کن.", mainMenuKeyboard()); return; }
+  if (data === "menu:status") { const key = await stateGet(env, "config:openrouter_key"); const model = await stateGet(env, "status:last_model") || "هنوز استفاده نشده"; const order = await getModelOrder(env); await telegramReply(env, chatId, "<b>📊 وضعیت سیستم</b>\n\n🟢 Worker: فعال\n📣 کانال: " + escapeHtml(env.CHANNEL_ID || "@Manotohubir") + "\n🔐 OpenRouter: " + (key ? "ثبت و رمزگذاری شده" : "ثبت نشده") + "\n🧠 مدل اصلی: <code>" + escapeHtml(order[0]) + "</code>\n🕘 آخرین مدل موفق: <code>" + escapeHtml(model) + "</code>\n⏱ انتشار خودکار: هر ۵ دقیقه", mainMenuKeyboard()); return; }
+  if (data === "menu:models") { const order = await getModelOrder(env); await telegramReply(env, chatId, "<b>🧠 انتخاب مدل اصلی</b>\n\nروی مدل دلخواه بزن؛ بقیه مدل‌ها به‌عنوان پشتیبان حفظ می‌شوند.", modelsKeyboard(order)); return; }
+  if (data.startsWith("model:")) { const index = Number(data.slice(6)); const order = await getModelOrder(env); if (!Number.isInteger(index) || index < 0 || index >= order.length) { await telegramReply(env, chatId, "انتخاب نامعتبر است.", mainMenuKeyboard()); return; } const chosen = order.splice(index, 1)[0]; order.unshift(chosen); await statePutPermanent(env, "config:model_order", JSON.stringify(order)); await telegramReply(env, chatId, "✅ مدل اصلی تغییر کرد به:\n<code>" + escapeHtml(chosen) + "</code>\nمدل‌های دیگر به‌عنوان پشتیبان حفظ شدند.", modelsKeyboard(order)); return; }
+  if (data === "menu:setkey") { await statePut(env, "telegram:awaiting_openrouter_key:" + fromId, "1", 600); await telegramReply(env, chatId, "🔐 <b>ثبت یا تغییر کلید OpenRouter</b>\n\nکلید را در پیام بعدی بفرست. پیام کلید پس از دریافت، تا حد امکان حذف می‌شود و مقدار آن رمزگذاری خواهد شد.", mainMenuKeyboard()); return; }
+  if (data === "menu:delkey") { await telegramReply(env, chatId, "<b>حذف کلید OpenRouter؟</b>\nبا تأیید، کلید ذخیره‌شده پاک می‌شود.", { inline_keyboard: [[{ text: "🗑 بله، حذف شود", callback_data: "confirm:delkey" }], [{ text: "لغو", callback_data: "menu:home" }]] }); return; }
+  if (data === "confirm:delkey") { await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "config:openrouter_key" }); await telegramReply(env, chatId, "🗑 کلید OpenRouter حذف شد.", mainMenuKeyboard()); return; }
+  if (data === "menu:test") { const key = await getOpenRouterKey(env); if (!key) { await telegramReply(env, chatId, "اول از دکمهٔ «ثبت / تغییر کلید» استفاده کن.", mainMenuKeyboard()); return; } const model = (await getModelOrder(env))[0] || MODEL_CATALOG[0].id; await telegramReply(env, chatId, "⏳ در حال آزمایش اتصال به مدل اصلی…"); const result = await callOpenRouterTest(key, model); await telegramReply(env, chatId, result.ok ? "✅ اتصال موفق است\nمدل پاسخ‌دهنده: <code>" + escapeHtml(model) + "</code>" : "❌ اتصال ناموفق بود\nمدل: <code>" + escapeHtml(model) + "</code>\nخطا: " + escapeHtml(result.error || "خطای نامشخص"), mainMenuKeyboard()); return; }
+  await telegramReply(env, chatId, "گزینه ناشناخته است. از منوی اصلی استفاده کن.", mainMenuKeyboard());
+}
+
 async function getModelOrder(env: Env): Promise<string[]> {
   try {
     const parsed = JSON.parse(await stateGet(env, "config:model_order") || "[]");
@@ -466,8 +507,8 @@ async function callOpenRouterTest(key: string, model: string): Promise<{ok: bool
   } catch (e) { return { ok: false, error: e instanceof Error ? e.message.slice(0, 180) : "خطای اتصال" }; }
 }
 
-async function telegramReply(env: Env, chatId: number | string, text: string) {
-  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true }), signal: AbortSignal.timeout(10000) });
+async function telegramReply(env: Env, chatId: number | string, text: string, replyMarkup?: Record<string, unknown>) {
+  const response = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML", disable_web_page_preview: true, ...(replyMarkup ? { reply_markup: replyMarkup } : {}) }), signal: AbortSignal.timeout(10000) });
   const data: any = await response.json().catch(() => ({}));
   if (!response.ok || !data.ok) {
     console.error("telegram_reply_failed", JSON.stringify({ httpStatus: response.status, errorCode: data.error_code || null, description: data.description || "invalid Telegram response" }));
