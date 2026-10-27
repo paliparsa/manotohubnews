@@ -29,6 +29,7 @@ interface AiPost {
   supportingIds: string[];
   reason: string;
   category: string;
+  topic?: string;
 }
 
 const DEFAULT_FEEDS: Array<{ url: string; language: string }> = [
@@ -145,71 +146,141 @@ async function runPipeline(env: Env, trigger: string) {
   const lockKey = "lock:run";
   const state = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
   if (!(await stateCall(state, { op: "acquire", key: lockKey, value: startedAt, ttl: 240 })).ok) return { ok: true, skipped: "another run appears active" };
-  let published = 0;
-  let queued = 0;
-  let examined = 0;
+  const stats: any = {
+    startedAt, trigger, status: "running", fetched: 0, earlyRejected: 0, examined: 0,
+    aiPosts: 0, published: 0, queued: 0, adminNotificationFailed: 0,
+    rejectionReasons: {}, feedErrors: [], filterRevision: await getFilterRevision(env)
+  };
+  const countReason = (reason: string) => { stats.rejectionReasons[reason] = Number(stats.rejectionReasons[reason] || 0) + 1; };
   try {
+    const settings = await getEditorialSettings(env);
     const fetched = await fetchFeeds(env);
+    stats.fetched = fetched.length;
+    const feedErrorsRaw = await stateGet(env, "status:feed_errors");
+    try { stats.feedErrors = JSON.parse(feedErrorsRaw || "[]"); } catch { stats.feedErrors = []; }
+    const revision = stats.filterRevision;
     const unique = new Map<string, NewsItem>();
     for (const item of fetched) {
+      const searchable = normalizeFilterText(item.title + " " + item.snippet);
+      const dateMs = Date.parse(item.publishedAt || "");
+      if (settings.maxAgeHours > 0 && Number.isFinite(dateMs) && Date.now() - dateMs > settings.maxAgeHours * 3600000) {
+        await recordRejected(env, item, "too_old", "سن خبر از محدودیت تنظیم‌شده بیشتر است", revision);
+        await markSeen(env, item, revision); stats.earlyRejected++; countReason("قدیمی‌تر از بازه");
+        continue;
+      }
+      const blocked = settings.blockKeywords.find(keyword => searchable.includes(keyword));
+      if (blocked) {
+        await recordRejected(env, item, "blocked_keyword", "کلمه ممنوع: " + blocked, revision);
+        await markSeen(env, item, revision); stats.earlyRejected++; countReason("کلمه ممنوع");
+        continue;
+      }
+      if (settings.allowKeywords.length && !settings.allowKeywords.some(keyword => searchable.includes(keyword))) {
+        await recordRejected(env, item, "not_in_allow_keywords", "هیچ کلمه‌ای از فهرست مجاز/اولویت‌دار پیدا نشد", revision);
+        await markSeen(env, item, revision); stats.earlyRejected++; countReason("خارج از فهرست کلمات مجاز");
+        continue;
+      }
       const urlKey = await hashKey(normalizeUrl(item.url));
       const titleKey = await hashKey(normalizeTitle(item.title));
-      const seenUrl = await stateGet(env, `seen:u:${urlKey}`);
-      const seenTitle = await stateGet(env, `seen:t:${titleKey}`);
+      const seenUrl = await stateGet(env, "seen:v" + revision + ":u:" + urlKey);
+      const seenTitle = await stateGet(env, "seen:v" + revision + ":t:" + titleKey);
       if (seenUrl || seenTitle) continue;
       unique.set(item.id, item);
     }
     const candidates = [...unique.values()].slice(0, clampInt(env.MAX_ITEMS_PER_RUN, 35, 1, 60));
-    examined = candidates.length;
-    if (!candidates.length) return { ok: true, trigger, fetched: fetched.length, candidates: 0, published: 0, message: "No new candidates" };
-
+    stats.examined = candidates.length;
+    if (!candidates.length) {
+      stats.status = "complete";
+      await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
+      return { ok: true, trigger, fetched: fetched.length, candidates: 0, published: 0, queued: 0 };
+    }
     const aiPosts = await curateWithOpenRouter(candidates, env);
+    stats.aiPosts = aiPosts.length;
     const maxPosts = clampInt(env.MAX_POSTS_PER_RUN, 4, 1, 8);
-    const minConfidence = clampFloat(env.MIN_CONFIDENCE, 0.78, 0, 1);
+    const minConfidence = confidenceThreshold(settings.sensitivity);
+    const handled = new Set<string>();
     for (const post of aiPosts) {
-      if (published >= maxPosts) break;
-      if (!post.relevant || !post.headline || !post.summary || post.confidence < minConfidence) continue;
       const supporting = candidates.filter(x => post.supportingIds.includes(x.id));
+      const topicId = EDITORIAL_TOPICS.some(t => t.id === post.topic) ? String(post.topic) : topicFromText(post.category + " " + post.headline + " " + post.summary);
+      if (!settings.topics.includes(topicId)) {
+        for (const item of supporting) { await recordRejected(env, item, "topic_disabled", "حوزه غیرفعال: " + topicId, revision); countReason("حوزه غیرفعال"); }
+        continue;
+      }
+      if (!post.relevant || !post.headline || !post.summary) {
+        for (const item of supporting) { await recordRejected(env, item, "ai_not_relevant", post.reason || "مدل خبر را مرتبط تشخیص نداد", revision); countReason("نامرتبط از نظر AI"); }
+        continue;
+      }
+      if (post.confidence < minConfidence) {
+        for (const item of supporting) { await recordRejected(env, item, "low_confidence", "اطمینان " + post.confidence + " کمتر از آستانه " + minConfidence, revision); countReason("اطمینان پایین"); }
+        continue;
+      }
       const domains = new Set(supporting.map(x => x.domain).filter(Boolean));
-      if (supporting.length === 0) continue;
-      // High-risk claims need multiple domains. Single-source reports are only allowed with an explicit preliminary label.
-      if (domains.size < 2 && post.status === "تأییدشده") continue;
-      if (post.status === "تأییدشده" && domains.size < 2) continue;
-
+      if (supporting.length === 0) { countReason("بدون منبع پشتیبان معتبر"); continue; }
+      if (domains.size < 2 && post.status === "تأییدشده") {
+        for (const item of supporting) { await recordRejected(env, item, "insufficient_sources", "تأیید چندمنبعی بدون دو دامنه مستقل ممکن نیست", revision); countReason("منابع ناکافی"); }
+        continue;
+      }
+      if (stats.published + stats.queued >= maxPosts) {
+        for (const item of supporting) { await recordRejected(env, item, "run_limit", "سقف خبرهای این اجرا پر شده است", revision); countReason("سقف اجرا"); }
+        continue;
+      }
       const postKey = await hashKey(normalizeTitle(post.headline));
-      if (await stateGet(env, `posted:${postKey}`)) continue;
-      const sourceLines = supporting.slice(0, 4).map(s => `• <a href="${escapeAttr(s.url)}">${escapeHtml(s.source || s.domain)}</a>`).join("\n");
+      if (await stateGet(env, "posted:" + postKey)) {
+        for (const item of supporting) { handled.add(item.id); await recordRejected(env, item, "duplicate_post", "تیتر مشابه قبلاً منتشر شده است", revision); countReason("تکراری"); }
+        continue;
+      }
+      const sourceLines = supporting.slice(0, 4).map(s => "• <a href=\"" + escapeAttr(s.url) + "\">" + escapeHtml(s.source || s.domain) + "</a>").join("\n");
       const publishedAt = new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran", dateStyle: "medium", timeStyle: "short" });
       const statusLine = post.status === "تأییدشده" ? "✅ <b>تأیید چندمنبعی</b>" : post.status === "گزارش اولیه" ? "⚠️ <b>گزارش اولیه؛ نیازمند پیگیری</b>" : "🔎 <b>در حال بررسی</b>";
-      const message = `📰 <b>${escapeHtml(post.headline)}</b>\n\n${escapeHtml(post.summary)}\n\n${statusLine}\n🏷️ <b>حوزه:</b> ${escapeHtml(post.category || "تحولات منطقه") }\n\n<b>منابع:</b>\n${sourceLines}\n\n🕒 <b>زمان انتشار:</b> ${escapeHtml(publishedAt)} (تهران)\n@Manotohubir`;
+      const message = "📰 <b>" + escapeHtml(post.headline) + "</b>\n\n" + escapeHtml(post.summary) + "\n\n" + statusLine +
+        "\n🏷️ <b>حوزه:</b> " + escapeHtml(post.category || "تحولات منطقه") + "\n\n<b>منابع:</b>\n" + sourceLines +
+        "\n\n🕒 <b>زمان انتشار:</b> " + escapeHtml(publishedAt) + " (تهران)\n@Manotohubir";
       const publication = await getPublicationSettings(env);
       if (publication.enabled && publication.mode === "auto") {
         await telegramSend(env, message);
-        await statePut(env, `posted:${postKey}`, JSON.stringify({ at: startedAt, headline: post.headline, supporting: supporting.map(s => s.url) }), 60 * 60 * 24 * 30);
-        published++;
+        await statePut(env, "posted:" + postKey, JSON.stringify({ at: startedAt, headline: post.headline, supporting: supporting.map(s => s.url) }), 60 * 60 * 24 * 30);
+        stats.published++;
       } else {
-        await statePutPermanent(env, `pending:${postKey}`, JSON.stringify({ postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url) }));
+        await statePutPermanent(env, "pending:" + postKey, JSON.stringify({ postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url) }));
         if (env.ADMIN_TELEGRAM_ID) {
           const reason = !publication.enabled ? "انتشار خاموش است؛ پیش‌نویس برای بررسی ذخیره شد." : "منتظر تأیید تو برای انتشار در کانال است.";
-          await telegramReply(env, env.ADMIN_TELEGRAM_ID, `📝 <b>خبر آمادهٔ انتشار</b>\n${escapeHtml(reason)}\n\n${message}`, { inline_keyboard: [[{ text: "✅ تأیید و انتشار", callback_data: `publish:${postKey}` }, { text: "🗑 رد خبر", callback_data: `skip:${postKey}` }]] });
+          try {
+            await telegramReply(env, env.ADMIN_TELEGRAM_ID, "📝 <b>خبر آمادهٔ انتشار</b>\n" + escapeHtml(reason) + "\n\n" + message, { inline_keyboard: [[{ text: "✅ تأیید و انتشار", callback_data: "publish:" + postKey }, { text: "🗑 رد خبر", callback_data: "skip:" + postKey }]] });
+          } catch (error) {
+            stats.adminNotificationFailed++;
+            console.error("admin_notification_failed", JSON.stringify({ postKey, error: error instanceof Error ? error.message : String(error) }));
+            countReason("خطای ارسال پیش‌نویس به ادمین");
+          }
+        } else {
+          stats.adminNotificationFailed++;
+          console.error("admin_notification_failed", "ADMIN_TELEGRAM_ID is not configured");
+          countReason("شناسه ادمین تنظیم نشده");
         }
-        queued++;
+        stats.queued++;
       }
-      for (const item of supporting) await markSeen(env, item);
+      for (const item of supporting) { handled.add(item.id); await markSeen(env, item, revision); }
     }
-    // Record remaining candidates so they aren't repeatedly sent to the model, but keep a shorter TTL.
-    for (const item of candidates) await markSeen(env, item);
-    await statePut(env, "last_run", JSON.stringify({ startedAt, trigger, fetched: fetched.length, examined, published, queued }), 60 * 60 * 24 * 7);
-    return { ok: true, trigger, fetched: fetched.length, examined, published, queued };
+    for (const item of candidates) {
+      if (!handled.has(item.id)) {
+        await recordRejected(env, item, "not_selected_by_ai", "مدل این خبر را در خروجی نهایی انتخاب نکرد؛ برای جلوگیری از پردازش تکراری ثبت شد", revision);
+        await markSeen(env, item, revision);
+        countReason("انتخاب‌نشده توسط AI");
+      }
+    }
+    stats.status = "complete";
+    await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
+    return { ok: true, trigger, fetched: stats.fetched, examined: stats.examined, published: stats.published, queued: stats.queued };
   } catch (error) {
-    console.error("pipeline_error", error instanceof Error ? error.message : String(error));
-    return { ok: false, trigger, examined, published, error: error instanceof Error ? error.message : "unknown error" };
+    stats.status = "error";
+    stats.error = error instanceof Error ? error.message.slice(0, 900) : "unknown error";
+    console.error("pipeline_error", stats.error);
+    try { await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14); } catch {}
+    return { ok: false, trigger, examined: stats.examined, published: stats.published, error: stats.error };
   } finally {
     await stateCall(state, { op: "release", key: lockKey, value: startedAt });
   }
 }
 
-async function stateCall(stub: DurableObjectStub, body: Record<string, unknown>): Promise<any> {
+async function stateCall(async function stateCall(stub: DurableObjectStub, body: Record<string, unknown>): Promise<any> {
   const response = await stub.fetch("https://state.internal/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
   if (!response.ok) throw new Error(`State store failed: ${response.status}`);
   return response.json();
@@ -268,6 +339,114 @@ export class NewsState {
   }
 }
 
+
+type EditorialTopic = { id: string; label: string; hints: string[] };
+const EDITORIAL_TOPICS: EditorialTopic[] = [
+  { id: "iran", label: "ایران", hints: ["iran", "iranian", "tehran", "ایران", "تهران", "ایرانی"] },
+  { id: "world", label: "جهان و دیپلماسی", hints: ["world", "global", "international", "diplomacy", "foreign policy", "جهان", "بین‌الملل", "دیپلماسی", "سیاست خارجی"] },
+  { id: "war", label: "جنگ و امنیت", hints: ["war", "military", "attack", "missile", "security", "defense", "جنگ", "حمله", "موشک", "امنیت", "نظامی"] },
+  { id: "tech", label: "فناوری و هوش مصنوعی", hints: ["technology", "tech", "artificial intelligence", " ai ", "هوش مصنوعی", "فناوری", "تکنولوژی"] },
+  { id: "internet", label: "اینترنت و فیلترینگ", hints: ["internet", "filtering", "cyber", "telecom", "internet shutdown", "اینترنت", "فیلترینگ", "سایبری", "مخابرات"] },
+  { id: "economy", label: "اقتصاد و انرژی", hints: ["economy", "economic", "oil", "energy", "sanctions", "market", "اقتصاد", "نفت", "انرژی", "تحریم", "بازار"] },
+  { id: "turkey", label: "ترکیه", hints: ["turkey", "turkish", "ankara", "istanbul", "ترکیه", "آنکارا", "استانبول"] }
+];
+type EditorialSettings = { topics: string[]; allowKeywords: string[]; blockKeywords: string[]; sensitivity: "broad" | "balanced" | "strict"; maxAgeHours: number };
+function normalizeFilterText(value: string): string {
+  return value.toLocaleLowerCase("fa-IR").normalize("NFKC").replace(/[يى]/g, "ی").replace(/ك/g, "ک").replace(/[\u064B-\u065F\u0670]/g, " ").replace(/\s+/g, " ").trim();
+}
+function parseKeywordList(value: string | null): string[] {
+  if (!value) return [];
+  return [...new Set(value.split(/[\n,،;；|]+/).map(x => normalizeFilterText(x)).filter(x => x.length > 0 && x.length <= 80))].slice(0, 80);
+}
+async function getEditorialSettings(env: Env): Promise<EditorialSettings> {
+  const [topicsRaw, allowRaw, blockRaw, sensitivityRaw, ageRaw] = await Promise.all([
+    stateGet(env, "config:editorial_topics"),
+    stateGet(env, "config:allow_keywords"),
+    stateGet(env, "config:block_keywords"),
+    stateGet(env, "config:editorial_sensitivity"),
+    stateGet(env, "config:max_age_hours")
+  ]);
+  let topics = ["iran", "world", "war", "tech", "internet", "economy"];
+  try {
+    const parsed = JSON.parse(topicsRaw || "null");
+    if (Array.isArray(parsed)) topics = [...new Set(parsed.filter((x: unknown) => typeof x === "string" && EDITORIAL_TOPICS.some(t => t.id === x)))];
+  } catch {}
+  const sensitivity = sensitivityRaw === "broad" || sensitivityRaw === "strict" ? sensitivityRaw : "balanced";
+  const parsedAge = Number(ageRaw);
+  const maxAgeHours = ageRaw === "0" ? 0 : Number.isFinite(parsedAge) && parsedAge > 0 ? Math.max(1, Math.min(parsedAge, 720)) : 24;
+  return { topics, allowKeywords: parseKeywordList(allowRaw), blockKeywords: parseKeywordList(blockRaw), sensitivity, maxAgeHours };
+}
+async function bumpFilterRevision(env: Env): Promise<void> {
+  const raw = await stateGet(env, "config:filter_revision");
+  const next = Math.max(1, Number(raw || "0") + 1);
+  await statePutPermanent(env, "config:filter_revision", String(next));
+}
+async function getFilterRevision(env: Env): Promise<string> {
+  return (await stateGet(env, "config:filter_revision")) || "1";
+}
+function topicFromText(value: string): string {
+  const text = " " + normalizeFilterText(value) + " ";
+  const scores = EDITORIAL_TOPICS.map(topic => ({ id: topic.id, score: topic.hints.reduce((n, hint) => n + (text.includes(normalizeFilterText(hint)) ? 1 : 0), 0) }));
+  scores.sort((a, b) => b.score - a.score);
+  return scores[0]?.score ? scores[0].id : "iran";
+}
+function confidenceThreshold(sensitivity: EditorialSettings["sensitivity"]): number {
+  return sensitivity === "broad" ? 0.62 : sensitivity === "strict" ? 0.88 : 0.78;
+}
+async function recordRejected(env: Env, item: NewsItem, reason: string, detail: string, revision: string): Promise<void> {
+  const itemKey = await hashKey(normalizeUrl(item.url) + "|" + normalizeTitle(item.title));
+  await statePut(env, "rejected:" + itemKey, JSON.stringify({
+    id: item.id, title: item.title.slice(0, 300), url: item.url, source: item.source,
+    reason, detail: detail.slice(0, 240), rejectedAt: new Date().toISOString(), filterRevision: revision
+  }), 60 * 60 * 24 * 14);
+}
+async function editorialMenu(env: Env, chatId: number | string): Promise<void> {
+  const s = await getEditorialSettings(env);
+  const topicRows: Array<Array<{text: string; callback_data: string}>> = EDITORIAL_TOPICS.map(topic => [{
+    text: (s.topics.includes(topic.id) ? "✅ " : "▫️ ") + topic.label,
+    callback_data: "editorial:topic:" + topic.id
+  }]);
+  topicRows.push([{ text: "✏️ کلمات مجاز / اولویت‌دار", callback_data: "editorial:allow" }, { text: "🚫 کلمات ممنوع", callback_data: "editorial:block" }]);
+  topicRows.push([{ text: "🎚 حساسیت: " + (s.sensitivity === "broad" ? "گسترده" : s.sensitivity === "strict" ? "سخت‌گیرانه" : "متعادل"), callback_data: "editorial:sensitivity" }]);
+  topicRows.push([{ text: "🕒 بازه خبر: " + (s.maxAgeHours === 0 ? "بدون محدودیت" : s.maxAgeHours + " ساعت"), callback_data: "editorial:age" }]);
+  topicRows.push([{ text: "📊 گزارش اجرا و فیلترها", callback_data: "menu:diagnostics" }, { text: "⬅️ منوی اصلی", callback_data: "menu:home" }]);
+  const allowText = s.allowKeywords.length ? s.allowKeywords.join("، ") : "تنظیم نشده";
+  const blockText = s.blockKeywords.length ? s.blockKeywords.join("، ") : "تنظیم نشده";
+  const enabledTopics = EDITORIAL_TOPICS.filter(t => s.topics.includes(t.id)).map(t => t.label).join("، ") || "هیچ‌کدام";
+  await telegramReply(env, chatId, "<b>🎛 تنظیمات تحریریه</b>\n\n<b>حوزه‌های فعال:</b> " + escapeHtml(enabledTopics) +
+    "\n<b>کلمات مجاز/اولویت‌دار:</b> " + escapeHtml(allowText.slice(0, 500)) +
+    "\n<b>کلمات ممنوع:</b> " + escapeHtml(blockText.slice(0, 500)) +
+    "\n<b>حساسیت:</b> " + (s.sensitivity === "broad" ? "گسترده" : s.sensitivity === "strict" ? "سخت‌گیرانه" : "متعادل") +
+    "\n<b>حداکثر سن خبر:</b> " + (s.maxAgeHours === 0 ? "بدون محدودیت" : s.maxAgeHours + " ساعت") +
+    "\n\nکلمات را با ویرگول جدا کن. با تغییر تنظیمات، خبرهای اخیر با فیلتر نسخهٔ جدید دوباره ارزیابی می‌شوند؛ این تغییر به‌تنهایی خبر قدیمی را منتشر نمی‌کند.", { inline_keyboard: topicRows });
+}
+async function sendDiagnostics(env: Env, chatId: number | string): Promise<void> {
+  const raw = await stateGet(env, "last_run");
+  const feedErrorsRaw = await stateGet(env, "status:feed_errors");
+  let run: any = null;
+  let feedErrors: string[] = [];
+  try { run = raw ? JSON.parse(raw) : null; } catch {}
+  try { const v = JSON.parse(feedErrorsRaw || "[]"); if (Array.isArray(v)) feedErrors = v.map(String).slice(0, 10); } catch {}
+  const reasons = run?.rejectionReasons && typeof run.rejectionReasons === "object"
+    ? Object.entries(run.rejectionReasons).map(([k, v]) => escapeHtml(k) + ": " + String(v)).join("\n")
+    : "هنوز آماری ثبت نشده";
+  const body = "<b>📊 گزارش سلامت خبرخوان</b>\n\n" +
+    (run ? "<b>آخرین اجرا:</b> " + escapeHtml(String(run.startedAt || "—")) + "\n" +
+      "وضعیت: " + escapeHtml(String(run.status || (run.ok === false ? "خطا" : "تمام‌شده"))) + "\n" +
+      "منابع/خبرهای دریافت‌شده: " + Number(run.fetched || 0) + "\n" +
+      "فیلتر اولیه‌شده: " + Number(run.earlyRejected || 0) + "\n" +
+      "ارسال به AI: " + Number(run.examined || 0) + "\n" +
+      "خروجی‌های AI: " + Number(run.aiPosts || 0) + "\n" +
+      "صف تأیید: " + Number(run.queued || 0) + "\n" +
+      "منتشرشده: " + Number(run.published || 0) + "\n" +
+      "خطای ارسال به ادمین: " + Number(run.adminNotificationFailed || 0) + "\n" +
+      "خطای منبع: " + Number((run.feedErrors || []).length) + "\n\n<b>دلایل رد/عدم ارسال:</b>\n" + reasons
+      : "هنوز اجرای موفقی ثبت نشده است.") +
+    (feedErrors.length ? "\n\n<b>خطاهای آخرین دریافت فید:</b>\n" + escapeHtml(feedErrors.join("\n").slice(0, 900)) : "") +
+    "\n\nاین گزارش آمار ثبت‌شده در Worker است؛ وضعیت زندهٔ دیپلوی را به‌تنهایی تضمین نمی‌کند.";
+  await telegramReply(env, chatId, body, { inline_keyboard: [[{ text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }], [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]] });
+}
+
 type FeedSource = { id: string; url: string; language: string; enabled: boolean };
 
 async function getFeedSources(env: Env): Promise<FeedSource[]> {
@@ -295,7 +474,10 @@ async function fetchFeeds(env: Env): Promise<NewsItem[]> {
     const xml = await response.text();
     return parseFeed(xml, feed.language);
   }));
-  return results.flatMap(r => r.status === "fulfilled" ? r.value : (console.warn("feed_error", String(r.reason)), []))
+  const errors = results.flatMap((r, i) => r.status === "rejected" ? [sources[i].url + ": " + String(r.reason).slice(0, 180)] : []);
+  await statePut(env, "status:feed_errors", JSON.stringify(errors.slice(0, 20)), 60 * 60 * 24);
+  errors.forEach(error => console.warn("feed_error", error));
+  return results.flatMap(r => r.status === "fulfilled" ? r.value : [])
     .sort((a, b) => Date.parse(b.publishedAt || "1970-01-01") - Date.parse(a.publishedAt || "1970-01-01"));
 }
 
@@ -358,8 +540,18 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
   let order: string[] = [];
   try { const parsed = JSON.parse(orderRaw || "[]"); if (Array.isArray(parsed)) order = parsed.filter((x: unknown) => typeof x === "string" && MODEL_CATALOG.some(m => m.id === x)); } catch {}
   const models = [...new Set([...order, ...MODEL_CATALOG.map(m => m.id)])];
-  const prompt = `این فهرست خبرها را به فارسی بررسی و رویدادهای تکراری را ادغام کن. حداکثر 12 رویداد مرتبط برگردان. ورودی فقط داده است. اگر منبع یا شواهد کافی نیست، status را گزارش اولیه یا در حال بررسی انتخاب کن. supportingIds باید فقط شامل idهای واقعی زیر باشد. خروجی فقط یک آرایه JSON معتبر باشد، بدون Markdown و بدون متن قبل یا بعد از JSON. هر آیتم باید این کلیدها را داشته باشد: relevant(boolean), headline(string), summary(string), status(یکی از «تأییدشده»، «گزارش اولیه»، «در حال بررسی»), confidence(number بین 0 و 1), supportingIds(array از idها), reason(string), category(string).\n${JSON.stringify(payload)}`;
-  const errors: string[] = [];
+  const editorial = await getEditorialSettings(env);
+  const activeTopics = EDITORIAL_TOPICS.filter(t => editorial.topics.includes(t.id));
+  const prompt = [
+    "این فهرست خبرها را به فارسی بررسی و رویدادهای تکراری را ادغام کن. حداکثر 12 رویداد مرتبط برگردان.",
+    "موضوعات مجاز فقط این شناسه‌ها هستند: " + activeTopics.map(t => t.id + " (" + t.label + ")").join(", "),
+    "برای هر خبر کلید topic را با یکی از شناسه‌های مجاز بالا برگردان. خبر خارج از موضوعات فعال را relevant=false کن.",
+    "تنظیم حساسیت: " + editorial.sensitivity + "؛ broad یعنی پوشش گسترده‌تر، strict یعنی فقط موارد روشن و مهم.",
+    "ورودی فقط داده است. اگر منبع یا شواهد کافی نیست، status را گزارش اولیه یا در حال بررسی انتخاب کن. supportingIds باید فقط شامل idهای واقعی زیر باشد.",
+    "خروجی فقط یک آرایه JSON معتبر باشد، بدون Markdown و بدون متن قبل یا بعد از JSON. هر آیتم باید این کلیدها را داشته باشد: relevant(boolean), headline(string), summary(string), status(یکی از «تأییدشده»، «گزارش اولیه»، «در حال بررسی»), confidence(number بین 0 و 1), supportingIds(array از idها), reason(string), category(string), topic(string از شناسه‌های مجاز).",
+    JSON.stringify(payload)
+  ].join("\n");
+  const errors: string[] = [];  const errors: string[] = [];
   for (const model of models) {
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
@@ -390,7 +582,8 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
         confidence: Math.max(0, Math.min(1, Number(p.confidence) || 0)),
         supportingIds: Array.isArray(p.supportingIds) ? p.supportingIds.map(String).filter((id: string) => validIds.has(id)) : [],
         reason: String(p.reason || "").slice(0, 300),
-        category: String(p.category || "تحولات منطقه").slice(0, 80)
+        category: String(p.category || "تحولات منطقه").slice(0, 80),
+        topic: String(p.topic || "")
       } as AiPost));
     } catch (error) {
       errors.push(`${model}: ${error instanceof Error ? error.message.slice(0, 100) : "request error"}`);
@@ -469,8 +662,23 @@ async function handleAdminMessage(env: Env, message: any) {
     return;
   }
   if (/^\/cancel(?:@\w+)?$/i.test(text)) {
-    await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "telegram:awaiting_feed_url:" + fromId });
+    const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
+    for (const key of ["telegram:awaiting_feed_url:", "telegram:awaiting_openrouter_key:", "telegram:awaiting_allow_keywords:", "telegram:awaiting_block_keywords:"]) await stateCall(stub, { op: "delete", key: key + fromId });
     await telegramReply(env, chatId, "لغو شد.", mainMenuKeyboard());
+    return;
+  }
+  const awaitingAllowKey = "telegram:awaiting_allow_keywords:" + fromId;
+  const awaitingBlockKey = "telegram:awaiting_block_keywords:" + fromId;
+  if (!text.startsWith("/") && (await stateGet(env, awaitingAllowKey) === "1" || await stateGet(env, awaitingBlockKey) === "1")) {
+    const isAllow = await stateGet(env, awaitingAllowKey) === "1";
+    const key = isAllow ? "config:allow_keywords" : "config:block_keywords";
+    const value = /^پاک کن$/.test(text) ? "" : parseKeywordList(text).join(", ");
+    await statePutPermanent(env, key, value);
+    const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
+    await stateCall(stub, { op: "delete", key: awaitingAllowKey });
+    await stateCall(stub, { op: "delete", key: awaitingBlockKey });
+    await bumpFilterRevision(env);
+    await telegramReply(env, chatId, "✅ فهرست " + (isAllow ? "کلمات مجاز/اولویت‌دار" : "کلمات ممنوع") + " ذخیره شد. تعداد عبارت‌ها: " + parseKeywordList(value).length, { inline_keyboard: [[{ text: "🎛 بازگشت به تحریریه", callback_data: "menu:editorial" }], [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]] });
     return;
   }
   const awaitingFeedKey = "telegram:awaiting_feed_url:" + fromId;
@@ -542,7 +750,8 @@ async function handleAdminMessage(env: Env, message: any) {
 function mainMenuKeyboard() {
   return { inline_keyboard: [
     [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "📣 تنظیم انتشار", callback_data: "menu:publishing" }],
-    [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
+    [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }],
+    [{ text: "📈 گزارش اجرا", callback_data: "menu:diagnostics" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
     [{ text: "🔌 آزمایش اتصال", callback_data: "menu:test" }, { text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }],
     [{ text: "🗑 حذف کلید", callback_data: "menu:delkey" }]
   ] };
@@ -643,6 +852,34 @@ async function handleAdminCallback(env: Env, query: any) {
   if (!env.ADMIN_TELEGRAM_ID || fromId !== env.ADMIN_TELEGRAM_ID || query.message?.chat?.type !== "private") { await telegramAnswerCallback(env, query.id, "دسترسی ادمین ندارید"); return; }
   await telegramAnswerCallback(env, query.id);
   if (data === "menu:sources") { await sendSourcesMenu(env, chatId); return; }
+  if (data === "menu:editorial") { await editorialMenu(env, chatId); return; }
+  if (data === "menu:diagnostics") { await sendDiagnostics(env, chatId); return; }
+  if (data.startsWith("editorial:topic:")) {
+    const id = data.slice("editorial:topic:".length);
+    if (!EDITORIAL_TOPICS.some(t => t.id === id)) { await telegramReply(env, chatId, "حوزه نامعتبر است."); return; }
+    const settings = await getEditorialSettings(env);
+    settings.topics = settings.topics.includes(id) ? settings.topics.filter(x => x !== id) : [...settings.topics, id];
+    await statePutPermanent(env, "config:editorial_topics", JSON.stringify(settings.topics));
+    await bumpFilterRevision(env);
+    await editorialMenu(env, chatId); return;
+  }
+  if (data === "editorial:sensitivity") {
+    const settings = await getEditorialSettings(env);
+    const next = settings.sensitivity === "broad" ? "balanced" : settings.sensitivity === "balanced" ? "strict" : "broad";
+    await statePutPermanent(env, "config:editorial_sensitivity", next);
+    await bumpFilterRevision(env); await editorialMenu(env, chatId); return;
+  }
+  if (data === "editorial:age") {
+    const settings = await getEditorialSettings(env);
+    const next = settings.maxAgeHours === 6 ? 24 : settings.maxAgeHours === 24 ? 72 : settings.maxAgeHours === 72 ? 0 : 6;
+    await statePutPermanent(env, "config:max_age_hours", String(next));
+    await bumpFilterRevision(env); await editorialMenu(env, chatId); return;
+  }
+  if (data === "editorial:allow" || data === "editorial:block") {
+    const key = data === "editorial:allow" ? "telegram:awaiting_allow_keywords:" : "telegram:awaiting_block_keywords:";
+    await statePut(env, key + fromId, "1", 600);
+    await telegramReply(env, chatId, (data === "editorial:allow" ? "✏️ <b>کلمات مجاز/اولویت‌دار</b>" : "🚫 <b>کلمات ممنوع</b>") + "\n\nکلمات یا عبارت‌ها را با ویرگول جدا کن. برای پاک‌کردن فهرست، فقط «پاک کن» بفرست. برای لغو /cancel را بفرست."); return;
+  }
   if (data === "source:add") { await statePutPermanent(env, "telegram:awaiting_feed_url:" + fromId, "1"); await telegramReply(env, chatId, "➕ <b>افزودن منبع خبر</b>\n\nلینک مستقیم RSS/Atom را بفرست. زبان اختیاری است و اگر ننویسی fa در نظر گرفته می‌شود.\n\nمثال:\n<code>https://example.com/rss.xml | fa</code>\n\nبرای لغو، /cancel را بفرست."); return; }
   if (data.startsWith("source:list:")) { await sendSourcesMenu(env, chatId, Number(data.slice("source:list:".length)) || 0); return; }
   if (data.startsWith("source:toggle:")) {
@@ -747,12 +984,12 @@ async function telegramSend(env: Env, text: string) {
   const data: any = await response.json();
   if (!response.ok || !data.ok) throw new Error(`Telegram sendMessage failed: ${data.description || response.status}`);
 }
-async function markSeen(env: Env, item: NewsItem) {
+async function markSeen(env: Env, item: NewsItem, revision = "1") {
   const u = await hashKey(normalizeUrl(item.url));
   const t = await hashKey(normalizeTitle(item.title));
   await Promise.all([
-    statePut(env, `seen:u:${u}`, "1", 60 * 60 * 24 * 10),
-    statePut(env, `seen:t:${t}`, "1", 60 * 60 * 24 * 10)
+    statePut(env, "seen:v" + revision + ":u:" + u, "1", 60 * 60 * 24 * 10),
+    statePut(env, "seen:v" + revision + ":t:" + t, "1", 60 * 60 * 24 * 10)
   ]);
 }
 function normalizeUrl(url: string) { try { const u = new URL(url); u.hash = ""; ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "ocid", "fbclid", "gclid"].forEach(k => u.searchParams.delete(k)); return `${u.hostname.toLowerCase()}${u.pathname.replace(/\/$/, "")}${u.search}`.toLowerCase(); } catch { return url.trim().toLowerCase(); } }
