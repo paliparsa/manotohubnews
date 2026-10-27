@@ -556,7 +556,7 @@ async function sendSourcesMenu(env: Env, chatId: number | string, page = 0) {
   const visible = sources.slice(currentPage * pageSize, currentPage * pageSize + pageSize);
   const rows: Array<Array<{text: string; callback_data: string}>> = visible.map(source => {
     let host = source.url;
-    try { host = new URL(source.url).hostname.replace(/^www\\./, ""); } catch {}
+    try { host = new URL(source.url).hostname.replace(/^www\./, ""); } catch {}
     return [
       { text: (source.enabled ? "🟢 " : "⚫ ") + host.slice(0, 24), callback_data: "source:toggle:" + source.id },
       { text: source.enabled ? "⏸" : "▶️", callback_data: "source:toggle:" + source.id },
@@ -578,19 +578,19 @@ async function addFeedSourceFromMessage(env: Env, chatId: number | string, fromI
   const parts = rawInput.split("|").map(x => x.trim());
   const urlText = parts[0] || "";
   const language = (parts[1] || "fa").toLowerCase();
-  if (urlText.length > 500 || !/^https?:\\/\\//i.test(urlText) || !/^(fa|en|ar|he|tr|fr|de|ru|en\\/ar)$/.test(language)) {
+  if (urlText.length > 500 || !/^https?:\/\//i.test(urlText) || !/^(fa|en|ar|he|tr|fr|de|ru|en\/ar)$/.test(language)) {
     await telegramReply(env, chatId, "فرمت درست نیست. فقط لینک RSS/Atom با http یا https بفرست. زبان اختیاری است: fa, en, ar, he, tr, fr, de, ru.\nمثال: <code>https://example.com/rss.xml | fa</code>", mainMenuKeyboard());
     return;
   }
   let parsed: URL;
   try { parsed = new URL(urlText); } catch { await telegramReply(env, chatId, "آدرس URL معتبر نیست."); return; }
-  if (parsed.username || parsed.password || parsed.hostname === "localhost" || parsed.hostname.endsWith(".local") || parsed.hostname.endsWith(".internal") || /^\\d{1,3}(?:\\.\\d{1,3}){3}$/.test(parsed.hostname) || parsed.hostname.includes(":")) {
+  if (parsed.username || parsed.password || parsed.hostname === "localhost" || parsed.hostname.endsWith(".local") || parsed.hostname.endsWith(".internal") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(parsed.hostname) || parsed.hostname.includes(":")) {
     await telegramReply(env, chatId, "این آدرس قابل قبول نیست؛ از یک دامنهٔ عمومی با RSS/Atom استفاده کن.", mainMenuKeyboard());
     return;
   }
   const sources = await getFeedSources(env);
   if (sources.some(source => source.url === parsed.toString() || source.url === urlText)) {
-    await telegramReply(env, chatId, "این منبع قبلاً ثبت شده است.", undefined as any);
+    await telegramReply(env, chatId, "این منبع قبلاً ثبت شده است.", mainMenuKeyboard());
     await sendSourcesMenu(env, chatId);
     return;
   }
@@ -599,7 +599,7 @@ async function addFeedSourceFromMessage(env: Env, chatId: number | string, fromI
     const response = await fetch(parsed.toString(), { headers: { "user-agent": "ManotohubirNewsBot/1.0 (RSS reader)", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(10000), redirect: "follow" });
     if (!response.ok) { await telegramReply(env, chatId, `دریافت منبع ناموفق بود: HTTP ${response.status}. لینک RSS/Atom را بررسی کن.`, mainMenuKeyboard()); return; }
     const xml = await response.text();
-    if (!/<(?:rss|feed|rdf:RDF|item|entry)(?:\\s|>)/i.test(xml)) { await telegramReply(env, chatId, "این آدرس شبیه فید RSS/Atom نیست؛ لینک مستقیم فید را بفرست.", mainMenuKeyboard()); return; }
+    if (!/<(?:rss|feed|rdf:RDF|item|entry)(?:\s|>)/i.test(xml)) { await telegramReply(env, chatId, "این آدرس شبیه فید RSS/Atom نیست؛ لینک مستقیم فید را بفرست.", mainMenuKeyboard()); return; }
   } catch (e) {
     await telegramReply(env, chatId, "به فید دسترسی پیدا نکردم یا زمان اتصال تمام شد. لینک RSS/Atom دیگری امتحان کن.", mainMenuKeyboard());
     return;
