@@ -1,5 +1,8 @@
 # Changelog
 
+## 1.6.1 — 2026-10-28
+- Fix the `/cancel` command regex that caused Wrangler's esbuild parser to fail, restoring deployability of the source-management update.
+
 ## 1.6.0 — 2026-10-28
 - Add admin source management for listing configured RSS/Atom feeds, enabling/disabling sources, and deleting sources with confirmation.
 - Allow admins to add public RSS/Atom feed URLs with optional language tags; validate feed URLs before saving.
