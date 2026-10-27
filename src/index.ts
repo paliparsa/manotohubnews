@@ -468,7 +468,7 @@ async function handleAdminMessage(env: Env, message: any) {
     }
     return;
   }
-  if (/^\\/cancel(?:@\\w+)?$/i.test(text)) {
+  if (/^\/cancel(?:@\w+)?$/i.test(text)) {
     await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "telegram:awaiting_feed_url:" + fromId });
     await telegramReply(env, chatId, "لغو شد.", mainMenuKeyboard());
     return;
