@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.7.0 — 2026-10-28
+- Add Telegram editorial controls for topic categories, allow-list and block-list keywords, filter sensitivity, and maximum news age.
+- Make filter changes versioned so recent feed items can be evaluated again under updated rules without automatically publishing historical items.
+- Add persistent run diagnostics, rejection-reason counters, feed error summaries, and explicit logging/counting for failed admin draft notifications.
+- Fix the pipeline's blanket seen-marking behavior by recording per-item rejection reasons and using filter-revision-scoped seen keys.
+- Keep approval-before-publish and automatic publication behavior intact.
+
 ## 1.6.1 — 2026-10-28
 - Fix the `/cancel` command regex that caused Wrangler's esbuild parser to fail, restoring deployability of the source-management update.
 
