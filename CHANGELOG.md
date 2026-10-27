@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.2 — 2026-10-28
+- Automatically register the Telegram webhook when missing or pointing to the wrong Worker URL, with a safe force-refresh option on `/health?setupWebhook=1`.
+- Report webhook registration and delivery status from `/health` without exposing bot credentials; preserve queued Telegram updates during registration.
+
 ## 1.4.1 — 2026-10-28
 - Correct the Cloudflare Cron Trigger to run every five minutes, matching the news pipeline schedule and removing idle one-minute invocations.
 
