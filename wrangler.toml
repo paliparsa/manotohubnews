@@ -7,8 +7,8 @@ workers_dev = true
 enabled = true
 
 [triggers]
-# Poll Telegram admin commands every minute; news feed pipeline runs every five minutes.
-crons = ["* * * * *"]
+# Run the news publishing pipeline every five minutes; Telegram admin updates use the webhook.
+crons = ["*/5 * * * *"]
 
 [[durable_objects.bindings]]
 name = "NEWS_STATE"
