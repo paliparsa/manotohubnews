@@ -1,6 +1,6 @@
 {
   "name": "manotohubir-news-worker",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -13,4 +13,4 @@
     "typescript": "^5.9.3",
     "wrangler": "^4.42.0"
   }
-}
+}\n
