@@ -224,6 +224,10 @@ async function runPipeline(env: Env, trigger: string) {
         continue;
       }
       const postKey = await hashKey(normalizeTitle(post.headline));
+      if (await stateGet(env, "pending:" + postKey)) {
+        for (const item of supporting) { handled.add(item.id); await recordRejected(env, item, "already_pending", "این خبر از قبل در صف تأیید مدیر است", revision); await markSeen(env, item, revision); countReason("از قبل در صف تأیید"); }
+        continue;
+      }
       if (await stateGet(env, "posted:" + postKey)) {
         for (const item of supporting) { handled.add(item.id); await recordRejected(env, item, "duplicate_post", "تیتر مشابه قبلاً منتشر شده است", revision); await markSeen(env, item, revision); countReason("تکراری"); }
         continue;
