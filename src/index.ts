@@ -122,7 +122,9 @@ async function ensureTelegramWebhook(requestUrl: string, env: Env, force: boolea
     }
 
     const currentUrl = String(info.result?.url || "");
-    if (!force && currentUrl === targetUrl) {
+    const currentAllowedUpdates = Array.isArray(info.result?.allowed_updates) ? info.result.allowed_updates.map(String) : [];
+    const needsChannelPosts = !currentAllowedUpdates.includes("channel_post");
+    if (!force && currentUrl === targetUrl && !needsChannelPosts) {
       return {
         ok: true,
         configured: true,
@@ -223,6 +225,7 @@ async function runPipeline(env: Env, trigger: string) {
       countReason(stats.noCandidateReason);
       stats.status = "complete";
       await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
+      await cleanupProcessedTelegramPosts(env, fetched, revision);
       return { ok: true, trigger, fetched: fetched.length, candidates: 0, published: 0, queued: 0 };
     }
     const aiPosts = await curateWithOpenRouter(candidates, env);
@@ -309,6 +312,7 @@ async function runPipeline(env: Env, trigger: string) {
         countReason("انتخاب‌نشده توسط AI");
       }
     }
+    await cleanupProcessedTelegramPosts(env, fetched, revision);
     stats.status = "complete";
     await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
     return { ok: true, trigger, fetched: stats.fetched, examined: stats.examined, published: stats.published, queued: stats.queued };
@@ -1382,6 +1386,17 @@ async function fetchPendingTelegramPosts(env: Env): Promise<NewsItem[]> {
     } catch {}
   }
   return items;
+}
+async function cleanupProcessedTelegramPosts(env: Env, items: NewsItem[], revision: string) {
+  const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
+  for (const item of items) {
+    if (!item.source.startsWith("Telegram @")) continue;
+    const urlKey = await hashKey(normalizeUrl(item.url));
+    const titleKey = await hashKey(normalizeTitle(item.title));
+    const seenUrl = await stateGet(env, "seen:v" + revision + ":u:" + urlKey);
+    const seenTitle = await stateGet(env, "seen:v" + revision + ":t:" + titleKey);
+    if (seenUrl || seenTitle) await stateCall(stub, { op: "delete", key: "social:pending:" + item.id });
+  }
 }
 
 async function sendSourcesMenu(env: Env, chatId: number | string, page = 0) {
