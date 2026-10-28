@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.13.0 — 2026-10-28
+- Remove any possibility of choosing or falling back to a paid model: model selection only accepts OpenRouter's explicit `:free` variants plus the free `openrouter/free` router.
+- Discover the current OpenRouter free text-model catalog dynamically, cache it for 12 hours, and include newly available free models without requiring code edits.
+- Remove reliance on the expiring Laguna-only fallback; legacy saved model preferences that are no longer free are ignored.
+- Keep paid web search out of scheduled runs; free-model calls may still be subject to OpenRouter free-tier rate limits.
+
+
 ## 1.12.0 — 2026-10-28
 - Stop running paid Exa web search automatically every 15 minutes; scheduled news discovery now uses RSS feeds only.
 - Keep RSS ingestion scheduled every five minutes and retain broad Iran/Islamic Republic, Reza Pahlavi and team, Israel, US relations, war and security coverage.
