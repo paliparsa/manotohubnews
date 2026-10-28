@@ -241,13 +241,22 @@ async function runPipeline(env: Env, trigger: string) {
         "\n\n🕒 <b>زمان انتشار:</b> " + escapeHtml(publishedAt) + " (تهران)\n@Manotohubir";
       const publication = await getPublicationSettings(env);
       if (publication.enabled && publication.mode === "auto") {
-        await telegramSend(env, message);
-        await statePut(env, "posted:" + postKey, JSON.stringify({ at: startedAt, headline: post.headline, supporting: supporting.map(s => s.url) }), 60 * 60 * 24 * 30);
-        stats.published++;
+        try {
+          await telegramSend(env, message);
+          await statePut(env, "posted:" + postKey, JSON.stringify({ at: startedAt, headline: post.headline, supporting: supporting.map(s => s.url) }), 60 * 60 * 24 * 30);
+          stats.published++;
+        } catch (publishError) {
+          const errorText = publishError instanceof Error ? publishError.message.slice(0,240) : "خطای نامشخص";
+          await statePutPermanent(env, "pending:" + postKey, JSON.stringify({ postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url), status: "publish_error", retryCount: 1, lastError: errorText, lastAttemptAt: startedAt }));
+          stats.queued++; stats.adminNotificationFailed++;
+          console.error("auto_publish_failed", JSON.stringify({postKey,error:errorText}));
+          if (env.ADMIN_TELEGRAM_ID) { try { await telegramReply(env, env.ADMIN_TELEGRAM_ID, "❌ <b>انتشار خودکار ناموفق بود؛ خبر در صف بازیابی ذخیره شد.</b>\n"+escapeHtml(errorText)+"\n\n"+message,{inline_keyboard:[[{text:"🔁 تلاش برای انتشار",callback_data:"publish:"+postKey},{text:"🗑 رد خبر",callback_data:"skip:"+postKey}],[{text:"🧾 صف بازبینی",callback_data:"queue:list"}]]}); } catch (notifyError) { console.error("publish_failure_notification_failed", String(notifyError)); } }
+        }
       } else {
-        await statePutPermanent(env, "pending:" + postKey, JSON.stringify({ postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url) }));
-        if (env.ADMIN_TELEGRAM_ID) {
-          const reason = !publication.enabled ? "انتشار خاموش است؛ پیش‌نویس برای بررسی ذخیره شد." : "منتظر تأیید تو برای انتشار در کانال است.";
+        const pendingRecord = { postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url), status: "pending", retryCount: 0, lastError: null };
+        await statePutPermanent(env, "pending:" + postKey, JSON.stringify(pendingRecord));
+        if (publication.mode !== "save_only" && env.ADMIN_TELEGRAM_ID) {
+          const reason = publication.mode === "paused" || !publication.enabled ? "انتشار موقتاً متوقف است؛ پیش‌نویس برای بررسی ذخیره شد." : "منتظر تأیید تو برای انتشار در کانال است.";
           try {
             await telegramReply(env, env.ADMIN_TELEGRAM_ID, "📝 <b>خبر آمادهٔ انتشار</b>\n" + escapeHtml(reason) + "\n\n" + message, { inline_keyboard: [[{ text: "✅ تأیید و انتشار", callback_data: "publish:" + postKey }, { text: "🗑 رد خبر", callback_data: "skip:" + postKey }]] });
           } catch (error) {
@@ -255,7 +264,7 @@ async function runPipeline(env: Env, trigger: string) {
             console.error("admin_notification_failed", JSON.stringify({ postKey, error: error instanceof Error ? error.message : String(error) }));
             countReason("خطای ارسال پیش‌نویس به ادمین");
           }
-        } else {
+        } else if (publication.mode !== "save_only") {
           stats.adminNotificationFailed++;
           console.error("admin_notification_failed", "ADMIN_TELEGRAM_ID is not configured");
           countReason("شناسه ادمین تنظیم نشده");
@@ -290,6 +299,11 @@ async function stateCall(stub: DurableObjectStub, body: Record<string, unknown>)
   if (!response.ok) throw new Error(`State store failed: ${response.status}`);
   return response.json();
 }
+async function stateList(env: Env, prefix: string, limit = 30): Promise<Array<{key:string;value:string}>> {
+  const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
+  const result = await stateCall(stub, { op: "list", key: prefix, prefix, limit });
+  return Array.isArray(result.entries) ? result.entries.filter((x:any)=>x && typeof x.key === "string" && typeof x.value === "string") : [];
+}
 async function stateGet(env: Env, key: string): Promise<string | null> {
   const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
   const result = await stateCall(stub, { op: "get", key });
@@ -310,6 +324,15 @@ export class NewsState {
     const body = await request.json() as { op?: string; key?: string; value?: string; ttl?: number };
     const key = String(body.key || "");
     if (!key || key.length > 500) return Response.json({ ok: false, error: "invalid_key" }, { status: 400 });
+    if (body.op === "list") {
+      const prefix = String((body as any).prefix || "");
+      if (!prefix || prefix.length > 450) return Response.json({ ok: false, error: "invalid_prefix" }, { status: 400 });
+      const limit = Math.max(1, Math.min(Number((body as any).limit) || 30, 100));
+      const rows = await this.ctx.storage.list<{ value: string; expiresAt: number }>({ prefix, limit });
+      const now = Date.now(); const entries: Array<{ key: string; value: string }> = [];
+      for (const [k, row] of rows) { if (row.expiresAt && row.expiresAt < now) { await this.ctx.storage.delete(k); continue; } entries.push({ key: k, value: row.value }); }
+      return Response.json({ ok: true, entries });
+    }
     if (body.op === "get") {
       const row = await this.ctx.storage.get<{ value: string; expiresAt: number }>(key);
       if (!row) return Response.json({ ok: true, value: null });
@@ -418,7 +441,8 @@ function confidenceThreshold(sensitivity: EditorialSettings["sensitivity"]): num
 async function recordRejected(env: Env, item: NewsItem, reason: string, detail: string, revision: string): Promise<void> {
   const itemKey = await hashKey(normalizeUrl(item.url) + "|" + normalizeTitle(item.title));
   await statePut(env, "rejected:" + itemKey, JSON.stringify({
-    id: item.id, title: item.title.slice(0, 300), url: item.url, source: item.source,
+    id: item.id, title: item.title.slice(0, 300), url: item.url, source: item.source, domain: item.domain,
+    publishedAt: item.publishedAt, snippet: item.snippet, feedLanguage: item.feedLanguage,
     reason, detail: detail.slice(0, 240), rejectedAt: new Date().toISOString(), filterRevision: revision
   }), 60 * 60 * 24 * 14);
 }
@@ -791,6 +815,7 @@ function mainMenuKeyboard() {
     [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "📣 تنظیم انتشار", callback_data: "menu:publishing" }],
     [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }],
     [{ text: "📈 گزارش اجرا", callback_data: "menu:diagnostics" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
+    [{ text: "🧾 صف تأیید و بازبینی", callback_data: "queue:list" }, { text: "🧪 تست فیلترها", callback_data: "dryrun:start" }],
     [{ text: "🔎 جست‌وجوی خبر با موضوع دلخواه", callback_data: "topicsearch:start" }],
     [{ text: "🔌 آزمایش اتصال", callback_data: "menu:test" }, { text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }],
     [{ text: "🗑 حذف کلید", callback_data: "menu:delkey" }]
@@ -966,22 +991,22 @@ async function addFeedSourceFromMessage(env: Env, chatId: number | string, fromI
   await sendSourcesMenu(env, chatId);
 }
 
-async function getPublicationSettings(env: Env): Promise<{enabled: boolean; mode: "auto" | "approval"}> {
+type PublishingMode = "auto" | "approval" | "save_only" | "paused";
+async function getPublicationSettings(env: Env): Promise<{enabled: boolean; mode: PublishingMode}> {
   const [enabledRaw, modeRaw] = await Promise.all([stateGet(env, "config:publishing_enabled"), stateGet(env, "config:publishing_mode")]);
-  return { enabled: enabledRaw !== "false", mode: modeRaw === "approval" ? "approval" : "auto" };
+  const legacyEnabled = enabledRaw !== "false";
+  const mode: PublishingMode = !legacyEnabled ? "paused" : (["auto","approval","save_only","paused"].includes(modeRaw || "") ? modeRaw as PublishingMode : "auto");
+  return { enabled: true, mode };
 }
-function publishingKeyboard(settings: {enabled: boolean; mode: "auto" | "approval"}) {
-  return { inline_keyboard: [
-    [{ text: settings.enabled ? "🟢 انتشار روشن است — خاموش کن" : "🔴 انتشار خاموش است — روشن کن", callback_data: "publishing:toggle" }],
-    [{ text: settings.mode === "auto" ? "✅ انتشار خودکار (تغییر به تأیید)" : "📝 تأیید قبل از انتشار (تغییر به خودکار)", callback_data: "publishing:mode" }],
-    [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]
-  ] };
+function publishingKeyboard(settings: {enabled: boolean; mode: PublishingMode}) {
+  const modes: Array<{id:PublishingMode;label:string}> = [{id:"auto",label:"🤖 انتشار مستقیم"},{id:"approval",label:"📝 تأیید ادمین"},{id:"save_only",label:"💾 فقط ذخیره خبر"},{id:"paused",label:"⏸ توقف موقت انتشار"}];
+  return { inline_keyboard: [...modes.map(m => [{text:(settings.mode===m.id && settings.enabled ? "✅ " : "")+m.label,callback_data:"publishing:set:"+m.id}]), [{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]] };
 }
 async function sendPublishingSettings(env: Env, chatId: number | string) {
   const settings = await getPublicationSettings(env);
-  const stateText = settings.enabled ? "🟢 <b>انتشار روشن است</b>" : "🔴 <b>انتشار خاموش است</b>";
-  const modeText = settings.mode === "auto" ? "🤖 حالت: انتشار خودکار" : "📝 حالت: اول تأیید مدیر";
-  await telegramReply(env, chatId, `<b>📣 تنظیمات انتشار خبر</b>\n\n${stateText}\n${modeText}\n\nوقتی انتشار خاموش باشد، خبرهای آماده به‌صورت پیش‌نویس برایت ارسال می‌شوند و در کانال منتشر نمی‌شوند مگر اینکه خودت تأییدشان کنی.`, publishingKeyboard(settings));
+  const labels: Record<PublishingMode,string> = {auto:"انتشار مستقیم",approval:"تأیید ادمین پیش از انتشار",save_only:"فقط ذخیره خبر بدون انتشار خودکار",paused:"توقف موقت انتشار"};
+  const descriptions: Record<PublishingMode,string> = {auto:"خبرهای واجد شرایط مستقیم در کانال منتشر می‌شوند.",approval:"هر خبر پیش از انتشار به صف تأیید تو می‌رود.",save_only:"خبرها آماده و در صف ذخیره می‌شوند؛ انتشار خودکار ندارند و می‌توانی بعداً دستی بررسی‌شان کنی.",paused:"جمع‌آوری و آماده‌سازی ادامه دارد؛ انتشار متوقف است و خبرهای آماده در صف قابل‌بازیابی ذخیره می‌شوند."};
+  await telegramReply(env, chatId, "<b>📣 سیاست انتشار خبر</b>\n\nحالت فعلی: <b>"+labels[settings.mode]+"</b>\n\n"+descriptions[settings.mode]+"\n\nاین تنظیم مستقل از فیلتر موضوعات است؛ توقف انتشار، جمع‌آوری و آماده‌سازی را متوقف نمی‌کند.", publishingKeyboard(settings));
 }
 function modelsKeyboard(order: string[]) {
   const rows: Array<Array<{text: string; callback_data: string}>> = order.map((id, i) => [{ text: (i === 0 ? "✅ " : "") + (i + 1) + ". " + (MODEL_CATALOG.find(m => m.id === id)?.name || id), callback_data: "model:" + i }]);
@@ -999,6 +1024,11 @@ async function handleAdminCallback(env: Env, query: any) {
   if (data === "menu:sources") { await sendSourcesMenu(env, chatId); return; }
   if (data === "menu:editorial") { await editorialMenu(env, chatId); return; }
   if (data === "menu:diagnostics") { await sendDiagnostics(env, chatId); return; }
+  if (data === "queue:list") { await sendReviewQueue(env, chatId); return; }
+  if (data.startsWith("queue:notify:")) { await resendQueueNotification(env, chatId, data.slice("queue:notify:".length)); return; }
+  if (data === "rejected:list") { await sendRejectedQueue(env, chatId); return; }
+  if (data.startsWith("rejected:retry:")) { await retryRejectedItem(env, chatId, data.slice("rejected:retry:".length)); return; }
+  if (data === "dryrun:start") { await runDryRun(env, chatId); return; }
   if (data === "topics:add") {
     await statePut(env, "telegram:awaiting_topic_add:" + fromId, "1", 600);
     await telegramReply(env, chatId, "➕ <b>افزودن حوزهٔ خبری</b>\n\nنام حوزه را بفرست؛ می‌توانی بعد از علامت | کلمات کلیدی فارسی/انگلیسی را هم اضافه کنی.\nمثال: <code>بازی‌های ویدیویی | بازی، گیم، gaming، PlayStation، Xbox</code>\n\nبرای لغو /cancel را بفرست.");
@@ -1102,8 +1132,9 @@ async function handleAdminCallback(env: Env, query: any) {
     return;
   }
   if (data === "menu:publishing") { await sendPublishingSettings(env, chatId); return; }
-  if (data === "publishing:toggle") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_enabled", current.enabled ? "false" : "true"); await sendPublishingSettings(env, chatId); return; }
-  if (data === "publishing:mode") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_mode", current.mode === "auto" ? "approval" : "auto"); await sendPublishingSettings(env, chatId); return; }
+  if (data === "publishing:toggle") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_mode", current.mode === "paused" ? "auto" : "paused"); await statePutPermanent(env, "config:publishing_enabled", "true"); await sendPublishingSettings(env, chatId); return; }
+  if (data === "publishing:mode") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_mode", current.mode === "auto" ? "approval" : "auto"); await statePutPermanent(env, "config:publishing_enabled", "true"); await sendPublishingSettings(env, chatId); return; }
+  if (data.startsWith("publishing:set:")) { const mode = data.slice("publishing:set:".length); if (!(["auto","approval","save_only","paused"] as string[]).includes(mode)) { await telegramReply(env,chatId,"سیاست انتشار نامعتبر است."); return; } await statePutPermanent(env,"config:publishing_mode",mode); await statePutPermanent(env,"config:publishing_enabled","true"); await sendPublishingSettings(env,chatId); return; }
   if (data.startsWith("publish:") || data.startsWith("skip:")) {
     const approve = data.startsWith("publish:");
     const postKey = data.slice(approve ? 8 : 5);
@@ -1113,13 +1144,25 @@ async function handleAdminCallback(env: Env, query: any) {
     let pending: any;
     try { pending = JSON.parse(raw); } catch { await telegramReply(env, chatId, "اطلاعات پیش‌نویس قابل خواندن نیست.", mainMenuKeyboard()); return; }
     if (approve) {
-      await telegramSend(env, String(pending.message || ""));
-      await statePut(env, `posted:${postKey}`, JSON.stringify({ at: new Date().toISOString(), headline: pending.headline, supporting: pending.supporting || [], approvedBy: fromId }), 60 * 60 * 24 * 30);
-      await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: `pending:${postKey}` });
-      await telegramReply(env, chatId, `✅ خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» در کانال منتشر شد.`, mainMenuKeyboard());
+      try {
+        await telegramSend(env, String(pending.message || ""));
+        await statePut(env, `posted:${postKey}`, JSON.stringify({ at: new Date().toISOString(), headline: pending.headline, supporting: pending.supporting || [], approvedBy: fromId }), 60 * 60 * 24 * 30);
+        await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: `pending:${postKey}` });
+        await telegramReply(env, chatId, `✅ خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» در کانال منتشر شد.`, mainMenuKeyboard());
+      } catch (error) {
+        pending.status = "publish_error"; pending.retryCount = Number(pending.retryCount || 0) + 1; pending.lastError = error instanceof Error ? error.message.slice(0,240) : "خطای نامشخص"; pending.lastAttemptAt = new Date().toISOString();
+        await statePutPermanent(env, `pending:${postKey}`, JSON.stringify(pending));
+        console.error("manual_publish_failed", JSON.stringify({postKey,error:pending.lastError,retryCount:pending.retryCount}));
+        await telegramReply(env, chatId, "❌ انتشار ناموفق بود؛ خبر از صف حذف نشد و امکان تلاش مجدد وجود دارد.\nخطا: "+escapeHtml(pending.lastError), {inline_keyboard:[[{text:"🔁 تلاش مجدد",callback_data:"publish:"+postKey}],[{text:"🧾 بازگشت به صف",callback_data:"queue:list"}]]});
+      }
     } else {
+      const firstUrl = Array.isArray(pending.supporting) ? String(pending.supporting[0] || "") : "";
+      if (firstUrl && /^https?:\/\//i.test(firstUrl)) {
+        const itemKey = await hashKey(normalizeUrl(firstUrl) + "|" + normalizeTitle(String(pending.headline || "")));
+        await statePut(env, "rejected:" + itemKey, JSON.stringify({id:postKey,title:String(pending.headline||"").slice(0,300),url:firstUrl,source:new URL(firstUrl).hostname,domain:new URL(firstUrl).hostname,publishedAt:"",snippet:"",feedLanguage:"fa",reason:"admin_rejected",detail:"خبر توسط ادمین رد شد",rejectedAt:new Date().toISOString(),filterRevision:await getFilterRevision(env)}),60*60*24*14);
+      }
       await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: `pending:${postKey}` });
-      await telegramReply(env, chatId, `🗑 خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» رد شد و منتشر نمی‌شود.`, mainMenuKeyboard());
+      await telegramReply(env, chatId, `🗑 خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» رد شد و در فهرست خبرهای ردشده قابل بازبینی است.`, mainMenuKeyboard());
     }
     return;
   }
@@ -1132,6 +1175,122 @@ async function handleAdminCallback(env: Env, query: any) {
   if (data === "confirm:delkey") { await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "config:openrouter_key" }); await telegramReply(env, chatId, "🗑 کلید OpenRouter حذف شد.", mainMenuKeyboard()); return; }
   if (data === "menu:test") { const key = await getOpenRouterKey(env); if (!key) { await telegramReply(env, chatId, "اول از دکمهٔ «ثبت / تغییر کلید» استفاده کن.", mainMenuKeyboard()); return; } const model = (await getModelOrder(env))[0] || MODEL_CATALOG[0].id; await telegramReply(env, chatId, "⏳ در حال آزمایش اتصال به مدل اصلی…"); const result = await callOpenRouterTest(key, model); await telegramReply(env, chatId, result.ok ? "✅ اتصال موفق است\nمدل پاسخ‌دهنده: <code>" + escapeHtml(model) + "</code>" : "❌ اتصال ناموفق بود\nمدل: <code>" + escapeHtml(model) + "</code>\nخطا: " + escapeHtml(result.error || "خطای نامشخص"), mainMenuKeyboard()); return; }
   await telegramReply(env, chatId, "گزینه ناشناخته است. از منوی اصلی استفاده کن.", mainMenuKeyboard());
+}
+
+async function sendReviewQueue(env: Env, chatId: number | string): Promise<void> {
+  const entries = await stateList(env, "pending:", 40);
+  const rows: Array<Array<{text:string;callback_data:string}>> = [];
+  const lines: string[] = [];
+  for (const entry of entries.slice(0, 12)) {
+    try {
+      const p:any = JSON.parse(entry.value);
+      const id = entry.key.slice("pending:".length);
+      const status = p.status === "publish_error" ? "❌ خطای انتشار" : "📝 منتظر بررسی";
+      lines.push("• <b>"+escapeHtml(String(p.headline || "بدون تیتر").slice(0,120))+"</b>\n  "+status+(p.lastError ? "\n  خطا: "+escapeHtml(String(p.lastError).slice(0,120)) : ""));
+      rows.push([{text:"📣 انتشار",callback_data:"publish:"+id},{text:"🗑 رد",callback_data:"skip:"+id}]);
+      rows.push([{text:"🔔 ارسال دوباره اعلان",callback_data:"queue:notify:"+id}]);
+    } catch {}
+  }
+  rows.push([{text:"🧾 خبرهای ردشده",callback_data:"rejected:list"},{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]);
+  await telegramReply(env,chatId,"<b>🧾 صف تأیید و بازیابی</b>\n\n"+(lines.join("\n\n") || "صف خبرهای آماده خالی است.")+"\n\nتعداد موارد نمایش‌داده‌شده: "+lines.length, {inline_keyboard:rows});
+}
+async function resendQueueNotification(env: Env, chatId: number | string, postKey: string): Promise<void> {
+  if(!/^[a-f0-9]{1,64}$/i.test(postKey)){await telegramReply(env,chatId,"شناسهٔ خبر نامعتبر است.");return;}
+  const raw=await stateGet(env,"pending:"+postKey);if(!raw){await telegramReply(env,chatId,"این خبر دیگر در صف نیست.",{inline_keyboard:[[{text:"🧾 صف بازبینی",callback_data:"queue:list"}]]});return;}
+  let p:any;try{p=JSON.parse(raw);}catch{await telegramReply(env,chatId,"رکورد صف قابل خواندن نیست.");return;}
+  try{await telegramReply(env,env.ADMIN_TELEGRAM_ID,"🔔 <b>اعلان مجدد خبر صف</b>\n\n"+String(p.message||"") ,{inline_keyboard:[[{text:"📣 تأیید و انتشار",callback_data:"publish:"+postKey},{text:"🗑 رد خبر",callback_data:"skip:"+postKey}],[{text:"🧾 صف بازبینی",callback_data:"queue:list"}]]});p.notificationRetryAt=new Date().toISOString();p.notificationRetries=Number(p.notificationRetries||0)+1;await statePutPermanent(env,"pending:"+postKey,JSON.stringify(p));await telegramReply(env,chatId,"✅ اعلان دوباره ارسال شد.",{inline_keyboard:[[{text:"🧾 صف بازبینی",callback_data:"queue:list"}]]});}
+  catch(error){p.notificationError=error instanceof Error?error.message.slice(0,240):"خطای نامشخص";p.notificationRetryAt=new Date().toISOString();p.notificationRetries=Number(p.notificationRetries||0)+1;await statePutPermanent(env,"pending:"+postKey,JSON.stringify(p));console.error("queue_notification_retry_failed",JSON.stringify({postKey,error:p.notificationError}));await telegramReply(env,chatId,"❌ ارسال اعلان ناموفق بود؛ رکورد در صف باقی ماند.\n"+escapeHtml(p.notificationError),{inline_keyboard:[[{text:"🔁 تلاش دوباره",callback_data:"queue:notify:"+postKey}],[{text:"🧾 صف بازبینی",callback_data:"queue:list"}]]});}
+}
+async function sendRejectedQueue(env: Env, chatId: number | string): Promise<void> {
+  const entries = await stateList(env,"rejected:",60);
+  const parsed = entries.map(e=>{try{return {key:e.key.slice("rejected:".length),item:JSON.parse(e.value)};}catch{return null;}}).filter((x:any)=>x && x.item && x.item.title).sort((a:any,b:any)=>String(b.item.rejectedAt||"").localeCompare(String(a.item.rejectedAt||"")));
+  const rows: Array<Array<{text:string;callback_data:string}>> = [];
+  const lines:string[]=[];
+  for(const entry of parsed.slice(0,10)){
+    const item=entry.item;
+    lines.push("• <b>"+escapeHtml(String(item.title).slice(0,130))+"</b>\n  دلیل: "+escapeHtml(String(item.detail || item.reason || "نامشخص").slice(0,180))+"\n  زمان: "+escapeHtml(String(item.rejectedAt || "—")));
+    rows.push([{text:"🔁 بازپردازش این خبر",callback_data:"rejected:retry:"+entry.key}]);
+  }
+  rows.push([{text:"⬅️ صف تأیید",callback_data:"queue:list"},{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]);
+  await telegramReply(env,chatId,"<b>🗂 خبرهای ردشده و قابل بازبینی</b>\n\n"+(lines.join("\n\n") || "خبر ردشده‌ای در بازهٔ نگهداری پیدا نشد.")+"\n\nفقط ۱۰ مورد آخر از حداکثر "+parsed.length+" مورد نمایش داده می‌شود. بازپردازش از فیلترهای فعلی عبور می‌کند و به‌تنهایی چیزی منتشر نمی‌کند.",{inline_keyboard:rows});
+}
+async function retryRejectedItem(env: Env, chatId: number | string, itemKey: string): Promise<void> {
+  if(!/^[a-f0-9]{1,64}$/i.test(itemKey)){await telegramReply(env,chatId,"شناسهٔ خبر نامعتبر است.");return;}
+  const raw=await stateGet(env,"rejected:"+itemKey);
+  if(!raw){await telegramReply(env,chatId,"این رکورد منقضی شده یا قبلاً پاک شده است.",{inline_keyboard:[[{text:"🗂 خبرهای ردشده",callback_data:"rejected:list"}]]});return;}
+  let saved:any;try{saved=JSON.parse(raw);}catch{await telegramReply(env,chatId,"رکورد خبر قابل خواندن نیست.");return;}
+  if(!saved.url || !/^https?:\/\//i.test(saved.url)){await telegramReply(env,chatId,"این رکورد لینک معتبر برای بازپردازش ندارد.");return;}
+  const item:NewsItem={id:String(saved.id||itemKey),title:String(saved.title||""),url:String(saved.url),source:String(saved.source||new URL(saved.url).hostname),domain:String(saved.domain||new URL(saved.url).hostname),publishedAt:String(saved.publishedAt||""),snippet:String(saved.snippet||""),feedLanguage:String(saved.feedLanguage||"fa")};
+  const settings=await getEditorialSettings(env);
+  const searchable=normalizeFilterText(item.title+" "+item.snippet);
+  if(settings.maxAgeHours>0 && item.publishedAt && Number.isFinite(Date.parse(item.publishedAt)) && Date.now()-Date.parse(item.publishedAt)>settings.maxAgeHours*3600000){await telegramReply(env,chatId,"هنوز رد می‌شود: خبر از بازهٔ زمانی فعلی قدیمی‌تر است.");return;}
+  const blocked=settings.blockKeywords.find(k=>searchable.includes(k));
+  if(blocked){await telegramReply(env,chatId,"هنوز رد می‌شود؛ کلمهٔ ممنوع فعلی: "+escapeHtml(blocked));return;}
+  if(settings.allowKeywords.length && !settings.allowKeywords.some(k=>searchable.includes(k))){await telegramReply(env,chatId,"هنوز رد می‌شود؛ هیچ کلمه‌ای از فهرست مجاز پیدا نشد.");return;}
+  await telegramReply(env,chatId,"⏳ خبر را با تنظیمات فعلی دوباره به AI می‌فرستم؛ انتشار خودکار انجام نمی‌شود.");
+  try{
+    const posts=await curateWithOpenRouter([item],env);
+    const post=posts.find(p=>p.relevant && p.headline && p.summary && p.supportingIds.includes(item.id));
+    const topics=await getEditorialTopics(env);
+    const topic=post && (topics.some(t=>t.id===post.topic)?String(post.topic):topicFromText(post.category+" "+post.headline+" "+post.summary,topics));
+    if(!post || !topic || topic==="other" || !settings.topics.includes(topic) || post.confidence<confidenceThreshold(settings.sensitivity)){
+      saved.reason="retry_still_rejected";saved.detail=!post?"مدل خبر را انتخاب نکرد":topic==="other"||!topic||!settings.topics.includes(topic)?"موضوع در فهرست فعال نیست":"اطمینان مدل پایین‌تر از آستانه است";saved.reprocessedAt=new Date().toISOString();
+      await statePut(env,"rejected:"+itemKey,JSON.stringify(saved),60*60*24*14);
+      await telegramReply(env,chatId,"خبر پس از بازپردازش هم از فیلترهای فعلی عبور نکرد.\nدلیل: "+escapeHtml(saved.detail),{inline_keyboard:[[{text:"🗂 خبرهای ردشده",callback_data:"rejected:list"}]]});return;
+    }
+    const sources=[{id:item.id,title:item.title,url:item.url,source:item.source,domain:item.domain,publishedAt:item.publishedAt,snippet:item.snippet,feedLanguage:item.feedLanguage}];
+    const sourceLine="• <a href=\""+escapeAttr(item.url)+"\">"+escapeHtml(item.source)+"</a>";
+    const message="📰 <b>"+escapeHtml(post.headline)+"</b>\n\n"+escapeHtml(post.summary)+"\n\n⚠️ <b>بازپردازش دستی؛ یک منبع، نیازمند بررسی</b>\n🏷️ <b>حوزه:</b> "+escapeHtml(post.category||topic)+"\n\n<b>منبع:</b>\n"+sourceLine+"\n\n@Manotohubir";
+    const postKey=await hashKey("retry|"+normalizeTitle(post.headline)+"|"+normalizeUrl(item.url));
+    const existing=await stateGet(env,"posted:"+postKey);
+    if(existing){await telegramReply(env,chatId,"خبر مشابه قبلاً منتشر شده؛ برای جلوگیری از تکرار به صف انتشار اضافه نشد.");return;}
+    await statePutPermanent(env,"pending:"+postKey,JSON.stringify({postKey,message,headline:post.headline,createdAt:new Date().toISOString(),supporting:sources.map(x=>x.url),status:"pending",retryCount:0,manualRetry:true}));
+    await telegramReply(env,chatId,message+"\n\n🔁 <b>بازپردازش موفق شد؛ انتشار نیازمند تأیید توست.</b>",{inline_keyboard:[[{text:"📣 تأیید و انتشار",callback_data:"publish:"+postKey},{text:"🗑 رد خبر",callback_data:"skip:"+postKey}],[{text:"🧾 صف بازبینی",callback_data:"queue:list"}]]});
+  }catch(error){const message=error instanceof Error?error.message:"خطای نامشخص";saved.retryError=message.slice(0,240);saved.retryAttemptAt=new Date().toISOString();await statePut(env,"rejected:"+itemKey,JSON.stringify(saved),60*60*24*14);console.error("rejected_item_retry_failed",JSON.stringify({itemKey,error:message}));await telegramReply(env,chatId,"❌ بازپردازش ناموفق بود؛ رکورد ردشده حفظ شد و می‌توانی دوباره تلاش کنی.\nخطا: "+escapeHtml(message.slice(0,180)),{inline_keyboard:[[{text:"🔁 تلاش مجدد",callback_data:"rejected:retry:"+itemKey}],[{text:"🗂 خبرهای ردشده",callback_data:"rejected:list"}]]});}
+}
+async function runDryRun(env: Env, chatId: number | string): Promise<void> {
+  await telegramReply(env,chatId,"🧪 در حال اجرای تست آزمایشی روی حداکثر ۳۰ خبر؛ هیچ چیزی در کانال منتشر یا به صف واقعی اضافه نمی‌شود.");
+  try{
+    const settings=await getEditorialSettings(env);
+    const fetched=(await fetchFeeds(env)).slice(0,90);
+    const sample=fetched.slice(0,30);
+    const counts:Record<string,number>={قبول:0,رد:0,"بررسی دستی":0,"فیلتر اولیه":0};
+    const reasons:Record<string,number>={};
+    const eligible:NewsItem[]=[];
+    const now=Date.now();
+    for(const item of sample){
+      const text=normalizeFilterText(item.title+" "+item.snippet);
+      const dt=Date.parse(item.publishedAt||"");
+      let reason="";
+      if(settings.maxAgeHours>0 && Number.isFinite(dt) && now-dt>settings.maxAgeHours*3600000) reason="قدیمی‌تر از بازه";
+      else if(settings.blockKeywords.some(k=>text.includes(k))) reason="کلمه ممنوع";
+      else if(settings.allowKeywords.length && !settings.allowKeywords.some(k=>text.includes(k))) reason="خارج از کلمات مجاز";
+      if(reason){counts["فیلتر اولیه"]++;reasons[reason]=(reasons[reason]||0)+1;}else eligible.push(item);
+    }
+    const candidates=eligible.slice(0,30);
+    let posts:AiPost[]=[];
+    if(candidates.length)posts=await curateWithOpenRouter(candidates,env);
+    const topics=await getEditorialTopics(env);
+    const active=new Set(settings.topics);
+    const handled=new Set<string>();
+    for(const post of posts){
+      const supporting=candidates.filter(x=>post.supportingIds.includes(x.id));
+      const topic=topics.some(t=>t.id===post.topic)?String(post.topic):topicFromText(post.category+" "+post.headline+" "+post.summary,topics);
+      let reason="";
+      if(!post.relevant||!post.headline||!post.summary)reason="نامرتبط از نظر AI";
+      else if(topic==="other"||!active.has(topic))reason="موضوع غیرفعال";
+      else if(post.confidence<confidenceThreshold(settings.sensitivity))reason="اطمینان پایین";
+      else if(!supporting.length)reason="منبع پشتیبان ندارد";
+      else if(post.status==="تأییدشده" && new Set(supporting.map(x=>x.domain)).size<2)reason="منابع ناکافی";
+      else if(supporting.length===1 || post.status!=="تأییدشده")counts["بررسی دستی"]++;
+      else counts["قبول"]++;
+      if(reason){counts["رد"]++;reasons[reason]=(reasons[reason]||0)+1;}
+      for(const item of supporting)handled.add(item.id);
+    }
+    for(const item of candidates)if(!handled.has(item.id)){counts["رد"]++;reasons["انتخاب‌نشده توسط AI"]=(reasons["انتخاب‌نشده توسط AI"]||0)+1;}
+    const out="<b>🧪 نتیجهٔ تست قوانین — بدون انتشار</b>\n\nنمونهٔ دریافت‌شده: "+sample.length+"\nعبورکرده از فیلتر اولیه: "+eligible.length+"\nارسال‌شده به AI: "+candidates.length+"\n\n✅ قبول: "+counts["قبول"]+"\n🟡 بررسی دستی: "+counts["بررسی دستی"]+"\n🔴 رد پس از AI: "+counts["رد"]+"\n⚪ رد در فیلتر اولیه: "+counts["فیلتر اولیه"]+"\n\n<b>دلایل:</b>\n"+(Object.entries(reasons).map(([k,v])=>escapeHtml(k)+": "+v).join("\n")||"بدون رد در این نمونه")+"\n\nاین یک شبیه‌سازی است؛ هیچ خبر منتشر یا به صف واقعی اضافه نشده است.";
+    await telegramReply(env,chatId,out,{inline_keyboard:[[{text:"🔁 اجرای دوباره",callback_data:"dryrun:start"},{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]]});
+  }catch(error){const msg=error instanceof Error?error.message:"خطای نامشخص";console.error("dry_run_failed",msg);await telegramReply(env,chatId,"❌ تست کامل نشد؛ هیچ خبری منتشر نشد.\nخطا: "+escapeHtml(msg.slice(0,220)),{inline_keyboard:[[{text:"🔁 تلاش دوباره",callback_data:"dryrun:start"}],[{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]]});}
 }
 
 async function getModelOrder(env: Env): Promise<string[]> {

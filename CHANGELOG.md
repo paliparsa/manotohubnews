@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.9.0 — 2026-10-28
+- Add a recoverable review queue with retryable publish failures and retryable admin notifications; failed stories remain persisted instead of disappearing.
+- Retain rejection metadata and source details for 14 days, expose rejected stories in Telegram, record manual admin rejections, and support selective reprocessing under current editorial rules without auto-publishing.
+- Add a no-publication dry run over up to 30 sample stories, reporting pre-filter rejects, AI accepts, manual-review candidates, and rejection reasons without adding drafts or publishing to the channel.
+- Expand publishing policy to direct publish, admin approval, save-only, and temporary pause; collection and preparation continue while publication is paused.
+
+
 ## 1.8.0 — 2026-10-28
 - Add persistent custom editorial topics with add/edit/delete controls in Telegram; deleting a custom topic removes it from active editorial filters without touching sources or published posts.
 - Add manual AI-assisted topic search using Google News RSS in Persian and English, source-grounded summaries, and per-story approve/publish or reject buttons. Manual search never publishes without explicit approval.
