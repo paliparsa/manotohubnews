@@ -1234,7 +1234,7 @@ async function resendQueueNotification(env: Env, chatId: number | string, postKe
 }
 async function sendRejectedQueue(env: Env, chatId: number | string): Promise<void> {
   const entries = await stateList(env,"rejected:",60);
-  const parsed = entries.map(e=>{try{return {key:e.key.slice("rejected:".length),item:JSON.parse(e.value)};}catch{return null;}}).filter((x:any)=>x && x.item && x.item.title).sort((a:any,b:any)=>String(b.item.rejectedAt||"").localeCompare(String(a.item.rejectedAt||"")));
+  const parsed = entries.map(e=>{try{return {key:e.key.slice("rejected:".length),item:JSON.parse(e.value)};}catch{return null;}}).filter((x): x is {key:string;item:any} => Boolean(x && x.item && x.item.title)).sort((a,b)=>String(b.item.rejectedAt||"").localeCompare(String(a.item.rejectedAt||"")));
   const rows: Array<Array<{text:string;callback_data:string}>> = [];
   const lines:string[]=[];
   for(const entry of parsed.slice(0,10)){
