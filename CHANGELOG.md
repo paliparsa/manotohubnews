@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.17.0 — 2026-10-28
+- Serialize RSS requests per hostname to avoid bursting Google News RSS with concurrent queries.
+- Increase retry handling for transient RSS HTTP errors to four attempts with exponential backoff and structured retry logs.
+- Report successful-but-unparseable feed responses as source errors instead of silently treating them as healthy.
+
 ## 1.16.0 — 2026-10-28
 - Align the default maximum news age with the RSS discovery window (7 days) instead of silently dropping relevant reports after 24 hours.
 - Migrate the legacy 6h/24h default to 168h once, preserve explicit 72h/336h/unlimited settings, and bump the filter revision so previously age-rejected stories can be reconsidered.
