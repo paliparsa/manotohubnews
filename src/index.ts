@@ -436,8 +436,21 @@ async function getEditorialSettings(env: Env): Promise<EditorialSettings> {
     if (Array.isArray(parsed)) topics = [...new Set(parsed.filter((x: unknown) => typeof x === "string" && allTopics.some(t => t.id === x)))];
   } catch {}
   const sensitivity = sensitivityRaw === "broad" || sensitivityRaw === "strict" ? sensitivityRaw : "balanced";
-  const parsedAge = Number(ageRaw);
-  const maxAgeHours = ageRaw === "0" ? 0 : Number.isFinite(parsedAge) && parsedAge > 0 ? Math.max(1, Math.min(parsedAge, 720)) : 24;
+  // Align the default with the RSS query window (up to 7 days). Older deployments
+  // implicitly used 24h; migrate that legacy default once, while preserving explicit
+  // wider windows and the user's intentional "no limit" setting.
+  let effectiveAgeRaw = ageRaw;
+  const ageMigrationKey = "config:age_filter_migration_v116";
+  if (!(await stateGet(env, ageMigrationKey))) {
+    if (!effectiveAgeRaw || effectiveAgeRaw === "24" || effectiveAgeRaw === "6") {
+      effectiveAgeRaw = "168";
+      await statePutPermanent(env, "config:max_age_hours", effectiveAgeRaw);
+    }
+    await bumpFilterRevision(env);
+    await statePutPermanent(env, ageMigrationKey, "done");
+  }
+  const parsedAge = Number(effectiveAgeRaw);
+  const maxAgeHours = effectiveAgeRaw === "0" ? 0 : Number.isFinite(parsedAge) && parsedAge > 0 ? Math.max(1, Math.min(parsedAge, 720)) : 168;
   return { topics, allowKeywords: parseKeywordList(allowRaw), blockKeywords: parseKeywordList(blockRaw), sensitivity, maxAgeHours };
 }
 async function bumpFilterRevision(env: Env): Promise<void> {
@@ -510,6 +523,7 @@ async function sendDiagnostics(env: Env, chatId: number | string): Promise<void>
       "ارسال به AI: " + Number(run.examined || 0) + "\n" +
       (run.noCandidateReason ? "دلیل صفر بودن ورودی AI: " + escapeHtml(String(run.noCandidateReason)) + "\n" : "") +
       "خروجی‌های AI: " + Number(run.aiPosts || 0) + "\n" +
+      (run.error ? "خطای اجرا: " + escapeHtml(String(run.error).slice(0, 700)) + "\n" : "") +
       "صف تأیید: " + Number(run.queued || 0) + "\n" +
       "منتشرشده: " + Number(run.published || 0) + "\n" +
       "خطای ارسال به ادمین: " + Number(run.adminNotificationFailed || 0) + "\n" +
@@ -978,11 +992,14 @@ function isPriorityIranNews(value: string): boolean {
   const terms = [
     "iran","iranian","tehran","islamic republic","irgc","iran israel","israel iran",
     "reẓa pahlavi","reza pahlavi","crown prince pahlavi","pahlavi team","national council of iran",
-    "israel","israeli","united states","united states of america","usa","washington","trump",
-    "war","missile","airstrike","attack","ceasefire","nuclear","sanction","negotiation",
+    "israel","israeli","united states","united states of america","usa","u.s.","us military","american","washington","trump",
+    "middle east","gulf","saudi arabia","saudi","qatar","lebanon","lebanese","syria","syrian",
+    "war","missile","airstrike","attack","ceasefire","nuclear","sanction","negotiation","patriot battery",
     "ایران","ایرانی","تهران","جمهوری اسلامی","سپاه پاسداران","شاهزاده پهلوی","رضا پهلوی",
     "تیم پهلوی","اسرائیل","اسرائیلی","آمریکا","ایالات متحده","ترامپ","جنگ","حمله","موشک",
-    "آتش بس","مذاکره","تحریم","هسته ای","هسته‌ای","اپوزیسیون","ائتلاف"
+    "خاورمیانه","خلیج فارس","عربستان","قطر","لبنان","سوریه","آتش بس","مذاکره","تحریم","هسته ای","هسته‌ای","اپوزیسیون","ائتلاف",
+    "إيران","إسرائيل","الولايات المتحدة","الشرق الأوسط","الخليج","السعودية","قطر","لبنان","سوريا",
+    "איראן","ישראל","ארצות הברית","המזרח התיכון","סעודיה","קטאר","לבנון","סוריה"
   ];
   return terms.some(term => text.includes(normalizeFilterText(term)));
 }
@@ -1325,7 +1342,7 @@ async function handleAdminCallback(env: Env, query: any) {
   }
   if (data === "editorial:age") {
     const settings = await getEditorialSettings(env);
-    const next = settings.maxAgeHours === 6 ? 24 : settings.maxAgeHours === 24 ? 72 : settings.maxAgeHours === 72 ? 0 : 6;
+    const next = settings.maxAgeHours === 24 ? 72 : settings.maxAgeHours === 72 ? 168 : settings.maxAgeHours === 168 ? 336 : settings.maxAgeHours === 336 ? 0 : 24;
     await statePutPermanent(env, "config:max_age_hours", String(next));
     await bumpFilterRevision(env); await editorialMenu(env, chatId); return;
   }
