@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.11.0 — 2026-10-28
+- Add automatic focused web search every 15 minutes for Iran, the Islamic Republic, Reza Pahlavi and his team, Israel, US relations, war and regional security; publish/queue results according to the existing publication policy.
+- Remove the two-independent-source rejection gate; single-source stories are kept and labeled as preliminary.
+- Relax age, allow/block keyword, topic-toggle and AI-confidence filters for priority Iran/Israel/US/Pahlavi stories; expand RSS search windows to seven days and add targeted Persian/English feeds.
+- Preserve duplicate prevention and real source links; do not fabricate URLs or facts.
+
+
 ## 1.10.0 — 2026-10-28
 - Replace manual topic search's Google News RSS dependency with OpenRouter's `openrouter:web_search` server tool.
 - Let the model run multiple web searches across online sources, synthesize up to eight distinct stories, and return source links with each candidate.
