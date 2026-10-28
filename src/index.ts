@@ -161,7 +161,17 @@ async function ensureTelegramWebhook(requestUrl: string, env: Env, force: boolea
   }
 }
 
+async function removeLegacyOpenRouterConfig(env:Env):Promise<void>{
+  if(await stateGet(env,"config:ai_migration_v119")==="done")return;
+  const stub=env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
+  for(const key of ["config:openrouter_key","cache:openrouter-free-models","config:model_order"]){
+    try{await stateCall(stub,{op:"delete",key});}catch(error){console.warn("legacy_ai_config_cleanup_failed",key,error instanceof Error?error.message:String(error));return;}
+  }
+  await statePutPermanent(env,"config:ai_migration_v119","done");
+  console.log("legacy_ai_config_removed");
+}
 async function runPipeline(env: Env, trigger: string) {
+  await removeLegacyOpenRouterConfig(env);
   const startedAt = new Date().toISOString();
   const lockKey = "lock:run";
   const state = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
@@ -754,6 +764,7 @@ function hexToBytes(hex: string) { if (!/^(?:[0-9a-f]{2})+$/i.test(hex)) throw n
 
 async function processTelegramUpdate(update: any, env: Env) {
   try {
+    await removeLegacyOpenRouterConfig(env);
     if (update.callback_query) await handleAdminCallback(env, update.callback_query);
     else if (update.message) await handleAdminMessage(env, update.message);
     else if (update.channel_post) await handleTelegramChannelPost(env, update.channel_post);
