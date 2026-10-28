@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.19.0 — 2026-10-28
+- Remove OpenRouter API integration, stored OpenRouter key flow, and OpenRouter-specific web-search tool from runtime code.
+- Add encrypted, separate credential management for Gemini, Groq, and Cloudflare Workers AI in the Telegram admin panel, including provider-specific deletion and connection tests.
+- Add provider-specific model catalogs and paginated model selection; choosing a model selects its provider as primary.
+- Add automatic provider fallback in order: selected provider, then other configured providers; validate Persian JSON output before accepting a result.
+- Keep manual topic search source-grounded by searching configured RSS/Atom items instead of relying on an OpenRouter web-search tool.
+- Keep API credentials encrypted with AES-GCM in Durable Object storage; Cloudflare credentials use `ACCOUNT_ID | API_TOKEN`.
+
+
 ## 1.18.0 — 2026-10-28
 - Add Persian inline-button management for social sources: list, add, enable/disable, and delete.
 - Ingest new posts from configured public Telegram channels through bot channel-post updates; refresh the webhook subscription when channel-post updates are missing.
