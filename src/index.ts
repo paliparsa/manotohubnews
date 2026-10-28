@@ -732,7 +732,7 @@ async function curateWithAI(items:NewsItem[],env:Env):Promise<AiPost[]>{const pa
  throw Error("All configured AI providers failed: "+errors.join(" | ").slice(0,900));
 }
 
-function parseJsonArray(text: string): any[] {function parseJsonArray(text: string): any[] {
+function parseJsonArray(text: string): any[] {
   const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
   try { const v = JSON.parse(cleaned); if (Array.isArray(v)) return v; } catch {}
   const start = cleaned.indexOf("[");
@@ -924,7 +924,7 @@ async function searchTopicAndSendCandidates(env:Env,chatId:number|string,query:s
  await telegramReply(env,chatId,added?"تمام شد؛ "+added+" خبر از فیدهای فعال برای تأیید آماده شد.":"خروجی قابل‌استناد برای این موضوع پیدا نشد.",mainMenuKeyboard());
  }catch(e){await telegramReply(env,chatId,"❌ جست‌وجوی موضوعی کامل نشد: "+escapeHtml(e instanceof Error?e.message.slice(0,220):"خطای نامشخص"),mainMenuKeyboard());}
 }
-function parsedUrlHostfunction parsedUrlHost(value: string): string {
+function parsedUrlHost(value: string): string {
   try { return new URL(value).hostname.replace(/^www\./, ""); } catch { return "منبع وب"; }
 }
 
@@ -1149,7 +1149,7 @@ async function sendPublishingSettings(env: Env, chatId: number | string) {
 }
 async function modelsKeyboard(env:Env,p:AiProvider,order:string[],page=0){const catalog=await getProviderModelCatalog(env,p),size=12,count=Math.max(1,Math.ceil(order.length/size)),pg=Math.max(0,Math.min(page,count-1)),rows:Array<Array<{text:string;callback_data:string}>>=[];for(let i=pg*size;i<Math.min(order.length,(pg+1)*size);i++)rows.push([{text:(i===0?"✅ ":"")+(i+1)+". "+(catalog.find(x=>x.id===order[i])?.name||order[i]).slice(0,48),callback_data:"model:"+p+":"+i}]);rows.push([{text:"🔎 Gemini",callback_data:"models:provider:gemini"},{text:"⚡ Groq",callback_data:"models:provider:groq"},{text:"☁️ Cloudflare",callback_data:"models:provider:cloudflare"}]);if(count>1)rows.push([{text:"⬅️ قبلی",callback_data:"models:page:"+p+":"+Math.max(0,pg-1)},{text:pg+1+"/"+count,callback_data:"models:provider:"+p},{text:"بعدی ➡️",callback_data:"models:page:"+p+":"+Math.min(count-1,pg+1)}]);rows.push([{text:"🔐 مدیریت کلیدها",callback_data:"menu:keys"},{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]);return{inline_keyboard:rows};}
 async function sendProviderKeysMenu(env:Env,chatId:number|string){const lines=await Promise.all(AI_PROVIDERS.map(async p=>"• "+providerLabel(p)+": "+(await getProviderKey(env,p)?"✅ ثبت شده":"❌ ثبت نشده")));await telegramReply(env,chatId,"<b>🔐 مدیریت کلیدهای API</b>\n\n"+lines.map(escapeHtml).join("\n")+"\n\nکلیدها با AES-GCM رمزگذاری می‌شوند. Cloudflare را با قالب <code>ACCOUNT_ID | API_TOKEN</code> وارد کن.",{inline_keyboard:[[{text:"🔑 کلید Gemini",callback_data:"keys:provider:gemini"}],[{text:"🔑 کلید Groq",callback_data:"keys:provider:groq"}],[{text:"🔑 دسترسی Cloudflare Workers AI",callback_data:"keys:provider:cloudflare"}],[{text:"🗑 حذف دسترسی",callback_data:"keys:delete"},{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]]});}
-async function telegramAnswerCallbackasync function telegramAnswerCallback(env: Env, callbackId: string, text = "") {
+async function telegramAnswerCallback(env: Env, callbackId: string, text = "") {
   try { await fetch("https://api.telegram.org/bot" + env.TELEGRAM_BOT_TOKEN + "/answerCallbackQuery", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ callback_query_id: callbackId, text: text.slice(0, 180) }), signal: AbortSignal.timeout(8000) }); } catch {}
 }
 async function handleAdminCallback(env: Env, query: any) {
