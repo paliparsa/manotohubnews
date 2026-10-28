@@ -555,30 +555,73 @@ async function saveFeedSources(env: Env, sources: FeedSource[]): Promise<void> {
 
 async function fetchFeeds(env: Env): Promise<NewsItem[]> {
   const sources = (await getFeedSources(env)).filter(feed => feed.enabled);
-  const results = await Promise.allSettled(sources.map(async feed => {
-    let lastError: unknown = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const response = await fetch(feed.url, { headers: { "user-agent": "ManotohubirNewsBot/1.0 (RSS reader)", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(12000), redirect: "follow" });
-        if (!response.ok) {
-          const retryable = response.status === 429 || [500, 502, 503, 504].includes(response.status);
-          if (retryable && attempt < 2) { await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1))); continue; }
-          throw new Error(`Feed ${new URL(feed.url).hostname} returned ${response.status} after ${attempt + 1} attempt(s)`);
+  // Google News RSS can return 503 when several queries hit it simultaneously.
+  // Serialize requests per hostname while allowing unrelated publishers to run in parallel.
+  const hostTails = new Map<string, Promise<void>>();
+  const fetchOne = async (feed: FeedSource): Promise<NewsItem[]> => {
+    const host = new URL(feed.url).hostname;
+    const previous = hostTails.get(host) || Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const tail = previous.then(() => gate);
+    hostTails.set(host, tail);
+    await previous;
+    try {
+      let lastError: unknown = null;
+      const maxAttempts = 4;
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          const response = await fetch(feed.url, {
+            headers: {
+              "user-agent": "Mozilla/5.0 (compatible; ManotohubirNewsBot/1.17; +https://manotohubir-news.workers.dev)",
+              accept: "application/rss+xml, application/atom+xml, application/xml, text/xml, */*"
+            },
+            signal: AbortSignal.timeout(12000),
+            redirect: "follow"
+          });
+          if (!response.ok) {
+            const retryable = response.status === 429 || [500, 502, 503, 504].includes(response.status);
+            if (retryable && attempt < maxAttempts - 1) {
+              const delayMs = Math.min(4000, 700 * (2 ** attempt));
+              console.warn("feed_retry", JSON.stringify({ host, status: response.status, attempt: attempt + 1, delayMs }));
+              await new Promise(resolve => setTimeout(resolve, delayMs));
+              continue;
+            }
+            throw new Error(`Feed ${host} returned ${response.status} after ${attempt + 1} attempt(s)`);
+          }
+          const xml = await response.text();
+          const parsed = parseFeed(xml, feed.language);
+          if (!parsed.length) {
+            // A successful HTTP response with an unexpected/empty body should be visible in diagnostics.
+            throw new Error(`Feed ${host} returned no parseable RSS/Atom entries`);
+          }
+          return parsed;
+        } catch (error) {
+          lastError = error;
+          if (attempt >= maxAttempts - 1) break;
+          const delayMs = Math.min(4000, 700 * (2 ** attempt));
+          console.warn("feed_retry", JSON.stringify({
+            host,
+            attempt: attempt + 1,
+            delayMs,
+            error: error instanceof Error ? error.message.slice(0, 160) : String(error).slice(0, 160)
+          }));
+          await new Promise(resolve => setTimeout(resolve, delayMs));
         }
-        const xml = await response.text();
-        return parseFeed(xml, feed.language);
-      } catch (error) {
-        lastError = error;
-        if (attempt >= 2) break;
-        await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
       }
+      throw lastError instanceof Error ? lastError : new Error("Feed request failed after retries");
+    } finally {
+      release();
     }
-    throw lastError instanceof Error ? lastError : new Error("Feed request failed after 3 attempts");
-  }));
-  const errors = results.flatMap((r, i) => r.status === "rejected" ? [sources[i].url + ": " + String(r.reason).slice(0, 180)] : []);
+  };
+
+  const results = await Promise.allSettled(sources.map(feed => fetchOne(feed)));
+  const errors = results.flatMap((result, i) => result.status === "rejected"
+    ? [sources[i].url + ": " + String(result.reason).slice(0, 180)]
+    : []);
   await statePut(env, "status:feed_errors", JSON.stringify(errors.slice(0, 20)), 60 * 60 * 24);
   errors.forEach(error => console.warn("feed_error", error));
-  return results.flatMap(r => r.status === "fulfilled" ? r.value : [])
+  return results.flatMap(result => result.status === "fulfilled" ? result.value : [])
     .sort((a, b) => Date.parse(b.publishedAt || "1970-01-01") - Date.parse(a.publishedAt || "1970-01-01"));
 }
 
