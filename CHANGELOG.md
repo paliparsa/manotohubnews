@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.18.0 — 2026-10-28
+- Add Persian inline-button management for social sources: list, add, enable/disable, and delete.
+- Ingest new posts from configured public Telegram channels through bot channel-post updates; refresh the webhook subscription when channel-post updates are missing.
+- Support X and Truth Social account records through user-configured RSS/Atom bridge URLs, with source attribution preserved through AI curation.
+- Queue Telegram posts for the existing AI relevance, Persian translation, and publication pipeline; clean processed posts while retaining unprocessed items.
+- Document platform access requirements: Telegram bot must be an administrator in each channel; X and Truth Social require a reachable RSS bridge in this version.
+
 ## 1.17.0 — 2026-10-28
 - Serialize RSS requests per hostname to avoid bursting Google News RSS with concurrent queries.
 - Increase retry handling for transient RSS HTTP errors to four attempts with exponential backoff and structured retry logs.

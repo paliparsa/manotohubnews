@@ -20,6 +20,14 @@ interface NewsItem {
   snippet: string;
   feedLanguage: string;
 }
+type SocialPlatform = "telegram" | "x" | "truthsocial";
+interface SocialSource {
+  id: string;
+  platform: SocialPlatform;
+  handle: string;
+  enabled: boolean;
+  feedUrl?: string;
+}
 interface AiPost {
   relevant: boolean;
   headline: string;
@@ -114,7 +122,9 @@ async function ensureTelegramWebhook(requestUrl: string, env: Env, force: boolea
     }
 
     const currentUrl = String(info.result?.url || "");
-    if (!force && currentUrl === targetUrl) {
+    const currentAllowedUpdates = Array.isArray(info.result?.allowed_updates) ? info.result.allowed_updates.map(String) : [];
+    const needsChannelPosts = !currentAllowedUpdates.includes("channel_post");
+    if (!force && currentUrl === targetUrl && !needsChannelPosts) {
       return {
         ok: true,
         configured: true,
@@ -130,7 +140,7 @@ async function ensureTelegramWebhook(requestUrl: string, env: Env, force: boolea
       body: JSON.stringify({
         url: targetUrl,
         secret_token: env.TELEGRAM_WEBHOOK_SECRET,
-        allowed_updates: ["message", "callback_query"],
+        allowed_updates: ["message", "callback_query", "channel_post"],
         drop_pending_updates: false
       }),
       signal: AbortSignal.timeout(10000)
@@ -166,8 +176,10 @@ async function runPipeline(env: Env, trigger: string) {
   try {
     const settings = await getEditorialSettings(env);
     const feedSources = (await getFeedSources(env)).filter(feed => feed.enabled);
-    stats.feedSources = feedSources.length;
-    const fetched = await fetchFeeds(env);
+    const socialSources = (await getSocialSources(env)).filter(source => source.enabled);
+    stats.feedSources = feedSources.length + socialSources.length;
+    const fetched = [...await fetchFeeds(env), ...await fetchPendingTelegramPosts(env)]
+      .sort((a, b) => Date.parse(b.publishedAt || "1970-01-01") - Date.parse(a.publishedAt || "1970-01-01"));
     stats.fetched = fetched.length;
     stats.feedItemsParsed = fetched.length;
     const feedErrorsRaw = await stateGet(env, "status:feed_errors");
@@ -213,6 +225,7 @@ async function runPipeline(env: Env, trigger: string) {
       countReason(stats.noCandidateReason);
       stats.status = "complete";
       await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
+      await cleanupProcessedTelegramPosts(env, fetched, revision);
       return { ok: true, trigger, fetched: fetched.length, candidates: 0, published: 0, queued: 0 };
     }
     const aiPosts = await curateWithOpenRouter(candidates, env);
@@ -299,6 +312,7 @@ async function runPipeline(env: Env, trigger: string) {
         countReason("انتخاب‌نشده توسط AI");
       }
     }
+    await cleanupProcessedTelegramPosts(env, fetched, revision);
     stats.status = "complete";
     await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
     return { ok: true, trigger, fetched: stats.fetched, examined: stats.examined, published: stats.published, queued: stats.queued };
@@ -554,7 +568,19 @@ async function saveFeedSources(env: Env, sources: FeedSource[]): Promise<void> {
 }
 
 async function fetchFeeds(env: Env): Promise<NewsItem[]> {
-  const sources = (await getFeedSources(env)).filter(feed => feed.enabled);
+  const rssSources = (await getFeedSources(env)).filter(feed => feed.enabled);
+  const socialSources = (await getSocialSources(env)).filter(source => source.enabled && source.platform !== "telegram" && Boolean(source.feedUrl));
+  const sources: FeedSource[] = [
+    ...rssSources,
+    ...socialSources.map(source => ({
+      id: source.id,
+      url: source.feedUrl!,
+      language: "en",
+      enabled: true,
+      socialPlatform: source.platform,
+      socialHandle: source.handle
+    } as FeedSource & { socialPlatform: SocialPlatform; socialHandle: string }))
+  ];
   // Google News RSS can return 503 when several queries hit it simultaneously.
   // Serialize requests per hostname while allowing unrelated publishers to run in parallel.
   const hostTails = new Map<string, Promise<void>>();
@@ -595,7 +621,13 @@ async function fetchFeeds(env: Env): Promise<NewsItem[]> {
             // A successful HTTP response with an unexpected/empty body should be visible in diagnostics.
             throw new Error(`Feed ${host} returned no parseable RSS/Atom entries`);
           }
-          return parsed;
+          const social = feed as FeedSource & { socialPlatform?: SocialPlatform; socialHandle?: string };
+          return parsed.map(item => social.socialPlatform && social.socialHandle ? {
+            ...item,
+            source: (social.socialPlatform === "x" ? "X" : "Truth Social") + " @" + social.socialHandle,
+            domain: social.socialPlatform === "x" ? "x.com" : "truthsocial.com",
+            feedLanguage: "en"
+          } : item);
         } catch (error) {
           lastError = error;
           if (attempt >= maxAttempts - 1) break;
@@ -859,6 +891,7 @@ async function processTelegramUpdate(update: any, env: Env) {
   try {
     if (update.callback_query) await handleAdminCallback(env, update.callback_query);
     else if (update.message) await handleAdminMessage(env, update.message);
+    else if (update.channel_post) await handleTelegramChannelPost(env, update.channel_post);
   } catch (e) {
     console.error("telegram_webhook_update_error", JSON.stringify({
       updateId: update.update_id,
@@ -884,7 +917,7 @@ async function handleAdminMessage(env: Env, message: any) {
   }
   if (/^\/cancel(?:@\w+)?$/i.test(text)) {
     const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
-    for (const key of ["telegram:awaiting_feed_url:", "telegram:awaiting_openrouter_key:", "telegram:awaiting_allow_keywords:", "telegram:awaiting_block_keywords:", "telegram:awaiting_topic_add:", "telegram:awaiting_topic_edit:", "telegram:awaiting_topic_search:", "telegram:topic_edit_id:"]) await stateCall(stub, { op: "delete", key: key + fromId });
+    for (const key of ["telegram:awaiting_feed_url:", "telegram:awaiting_social_source:", "telegram:awaiting_openrouter_key:", "telegram:awaiting_allow_keywords:", "telegram:awaiting_block_keywords:", "telegram:awaiting_topic_add:", "telegram:awaiting_topic_edit:", "telegram:awaiting_topic_search:", "telegram:topic_edit_id:"]) await stateCall(stub, { op: "delete", key: key + fromId });
     await telegramReply(env, chatId, "لغو شد.", mainMenuKeyboard());
     return;
   }
@@ -918,6 +951,11 @@ async function handleAdminMessage(env: Env, message: any) {
   const awaitingFeedKey = "telegram:awaiting_feed_url:" + fromId;
   if (!text.startsWith("/") && await stateGet(env, awaitingFeedKey) === "1") {
     await addFeedSourceFromMessage(env, chatId, fromId, text);
+    return;
+  }
+  const awaitingSocialKey = "telegram:awaiting_social_source:" + fromId;
+  if (!text.startsWith("/") && await stateGet(env, awaitingSocialKey) === "1") {
+    await addSocialSourceFromMessage(env, chatId, fromId, text);
     return;
   }
   const awaitingKeyKey = "telegram:awaiting_openrouter_key:" + fromId;
@@ -984,7 +1022,8 @@ async function handleAdminMessage(env: Env, message: any) {
 function mainMenuKeyboard() {
   return { inline_keyboard: [
     [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "📣 تنظیم انتشار", callback_data: "menu:publishing" }],
-    [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }],
+    [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "📡 منابع اجتماعی", callback_data: "social:menu" }],
+    [{ text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }],
     [{ text: "📈 گزارش اجرا", callback_data: "menu:diagnostics" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
     [{ text: "🧾 صف تأیید و بازبینی", callback_data: "queue:list" }, { text: "🧪 تست فیلترها", callback_data: "dryrun:start" }],
     [{ text: "🔎 جست‌وجوی خبر با موضوع دلخواه", callback_data: "topicsearch:start" }],
@@ -1222,6 +1261,144 @@ async function searchTopicAndSendCandidates(env: Env, chatId: number | string, q
 function parsedUrlHost(value: string): string {
   try { return new URL(value).hostname.replace(/^www\./, ""); } catch { return "منبع وب"; }
 }
+
+async function getSocialSources(env: Env): Promise<SocialSource[]> {
+  const raw = await stateGet(env, "config:social_sources");
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.filter((x: any) =>
+        x && typeof x.id === "string" &&
+        ["telegram", "x", "truthsocial"].includes(x.platform) &&
+        typeof x.handle === "string" && typeof x.enabled === "boolean" &&
+        (x.feedUrl === undefined || typeof x.feedUrl === "string")
+      ).slice(0, 100);
+    } catch {}
+  }
+  await statePutPermanent(env, "config:social_sources", "[]");
+  return [];
+}
+async function saveSocialSources(env: Env, sources: SocialSource[]): Promise<void> {
+  await statePutPermanent(env, "config:social_sources", JSON.stringify(sources.slice(0, 100)));
+}
+async function sendSocialSourcesMenu(env: Env, chatId: number | string, page = 0) {
+  const sources = await getSocialSources(env);
+  const pageSize = 8;
+  const maxPage = Math.max(0, Math.ceil(sources.length / pageSize) - 1);
+  const currentPage = Math.max(0, Math.min(maxPage, page));
+  const visible = sources.slice(currentPage * pageSize, currentPage * pageSize + pageSize);
+  const platformLabel = (platform: SocialPlatform) => platform === "telegram" ? "Telegram" : platform === "x" ? "X" : "Truth Social";
+  const rows: Array<Array<{text: string; callback_data: string}>> = visible.map(source => [
+    { text: (source.enabled ? "🟢 " : "⚫ ") + platformLabel(source.platform) + " @" + source.handle.slice(0, 18), callback_data: "social:toggle:" + source.id },
+    { text: source.enabled ? "⏸" : "▶️", callback_data: "social:toggle:" + source.id },
+    { text: "🗑", callback_data: "social:delete:" + source.id }
+  ]);
+  rows.push([{ text: "➕ افزودن حساب / کانال", callback_data: "social:add" }]);
+  const nav: Array<{text: string; callback_data: string}> = [];
+  if (currentPage > 0) nav.push({ text: "⬅️ قبلی", callback_data: "social:page:" + (currentPage - 1) });
+  if (currentPage < maxPage) nav.push({ text: "بعدی ➡️", callback_data: "social:page:" + (currentPage + 1) });
+  if (nav.length) rows.push(nav);
+  rows.push([{ text: "🗂 منابع RSS/Atom", callback_data: "menu:sources" }], [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]);
+  const active = sources.filter(x => x.enabled).length;
+  const lines = visible.map((source, i) => {
+    const method = source.platform === "telegram" ? "دریافت مستقیم با ادمین‌بودن بات در کانال" : "RSS bridge";
+    return `${currentPage * pageSize + i + 1}. ${source.enabled ? "🟢 فعال" : "⚫ غیرفعال"} — <b>${platformLabel(source.platform)} @${escapeHtml(source.handle)}</b> — ${method}`;
+  });
+  await telegramReply(env, chatId, `<b>📡 مدیریت منابع اجتماعی</b>\n\nکل منابع: ${sources.length} | فعال: ${active}\nبا زدن نام/وضعیت می‌توانی فعال یا غیرفعال کنی؛ 🗑 برای حذف.\n\n${lines.join("\n") || "هنوز منبع اجتماعی ثبت نشده."}\n\nبرای X و Truth Social، RSS bridge باید در زمان افزودن ثبت شود؛ برای Telegram، بات باید در کانال ادمین باشد.`, { inline_keyboard: rows });
+}
+async function addSocialSourceFromMessage(env: Env, chatId: number | string, fromId: string, rawInput: string) {
+  const parts = rawInput.split("|").map(x => x.trim());
+  const platformText = (parts[0] || "").toLowerCase();
+  const platform: SocialPlatform | null = platformText === "telegram" || platformText === "tg" ? "telegram" : platformText === "x" || platformText === "twitter" ? "x" : platformText === "truthsocial" || platformText === "truth" ? "truthsocial" : null;
+  const handle = (parts[1] || "").replace(/^@+/, "").trim();
+  if (!platform || !/^[A-Za-z0-9_]{1,64}$/.test(handle)) {
+    await telegramReply(env, chatId, "قالب شناسه درست نیست.\n<code>telegram | @channel</code>\n<code>x | @handle | https://.../rss</code>\n<code>truthsocial | @handle | https://.../rss</code>\nبرای لغو /cancel را بفرست.");
+    return;
+  }
+  let feedUrl: string | undefined;
+  if (platform !== "telegram") {
+    if (!parts[2] || parts[2].length > 500 || !/^https?:\/\//i.test(parts[2])) {
+      await telegramReply(env, chatId, "برای X و Truth Social باید URL یک فید RSS/Atom قابل‌دسترسی هم وارد کنی. صرف شناسه کافی نیست.\nمثال: <code>x | handle | https://rss-bridge.example/feed</code>");
+      return;
+    }
+    try {
+      const url = new URL(parts[2]);
+      if (url.username || url.password || url.hostname === "localhost" || url.hostname.endsWith(".local") || url.hostname.endsWith(".internal") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(url.hostname)) throw new Error("unsafe_url");
+      const response = await fetch(url.toString(), { headers: { "user-agent": "ManotohubirNewsBot/1.18 (RSS reader)", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(10000), redirect: "follow" });
+      if (!response.ok) { await telegramReply(env, chatId, `فید قابل دریافت نیست: HTTP ${response.status}.`); return; }
+      const xml = await response.text();
+      if (!/<(?:rss|feed|rdf:RDF|item|entry)(?:\s|>)/i.test(xml)) { await telegramReply(env, chatId, "این URL شبیه RSS/Atom نیست."); return; }
+      feedUrl = url.toString();
+    } catch (error) {
+      await telegramReply(env, chatId, "به RSS bridge دسترسی پیدا نکردم یا آدرس معتبر نیست. URL را بررسی کن.");
+      return;
+    }
+  } else if (parts.length > 2 && parts[2]) {
+    await telegramReply(env, chatId, "برای Telegram فقط شناسهٔ کانال عمومی لازم است: <code>telegram | @channel</code>");
+    return;
+  }
+  const sources = await getSocialSources(env);
+  if (sources.some(source => source.platform === platform && source.handle.toLowerCase() === handle.toLowerCase())) {
+    await telegramReply(env, chatId, "این حساب یا کانال قبلاً ثبت شده است.");
+    await sendSocialSourcesMenu(env, chatId);
+    return;
+  }
+  if (sources.length >= 100) { await telegramReply(env, chatId, "حداکثر ۱۰۰ منبع اجتماعی قابل ثبت است."); return; }
+  const source: SocialSource = { id: simpleHash(platform + "|" + handle.toLowerCase()).slice(0, 16), platform, handle, enabled: true, ...(feedUrl ? { feedUrl } : {}) };
+  sources.push(source);
+  await saveSocialSources(env, sources);
+  await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "telegram:awaiting_social_source:" + fromId });
+  const note = platform === "telegram"
+    ? "منبع ثبت شد. حالا بات را در کانال عمومی ادمین کن؛ از پست‌های جدید به بعد دریافت انجام می‌شود."
+    : "منبع ثبت شد. دریافت پست‌ها از RSS bridge انجام می‌شود؛ پایداری آن به سرویس bridge وابسته است.";
+  await telegramReply(env, chatId, "✅ " + note);
+  await sendSocialSourcesMenu(env, chatId);
+}
+async function handleTelegramChannelPost(env: Env, post: any) {
+  const chat = post?.chat;
+  const handle = String(chat?.username || "").replace(/^@+/, "");
+  const textBody = String(post?.text || post?.caption || "").trim();
+  if (!handle || !textBody || !post?.message_id || !post?.date) return;
+  const source = (await getSocialSources(env)).find(item => item.platform === "telegram" && item.enabled && item.handle.toLowerCase() === handle.toLowerCase());
+  if (!source) return;
+  const url = `https://t.me/${handle}/${post.message_id}`;
+  const publishedAt = new Date(Number(post.date) * 1000).toISOString();
+  const item: NewsItem = {
+    id: simpleHash("telegram|" + handle.toLowerCase() + "|" + post.message_id),
+    title: textBody.replace(/\s+/g, " ").slice(0, 400),
+    url,
+    source: "Telegram @" + handle,
+    domain: "t.me",
+    publishedAt,
+    snippet: textBody.slice(0, 900),
+    feedLanguage: "fa"
+  };
+  await statePut(env, "social:pending:" + item.id, JSON.stringify(item), 60 * 60 * 24 * 7);
+  console.log("social_telegram_post_received", JSON.stringify({ handle, messageId: post.message_id, itemId: item.id }));
+}
+async function fetchPendingTelegramPosts(env: Env): Promise<NewsItem[]> {
+  const entries = await stateList(env, "social:pending:", 100);
+  const items: NewsItem[] = [];
+  for (const entry of entries) {
+    try {
+      const item = JSON.parse(entry.value) as NewsItem;
+      if (item && typeof item.id === "string" && typeof item.title === "string" && typeof item.url === "string" && typeof item.snippet === "string") items.push(item);
+    } catch {}
+  }
+  return items;
+}
+async function cleanupProcessedTelegramPosts(env: Env, items: NewsItem[], revision: string) {
+  const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
+  for (const item of items) {
+    if (!item.source.startsWith("Telegram @")) continue;
+    const urlKey = await hashKey(normalizeUrl(item.url));
+    const titleKey = await hashKey(normalizeTitle(item.title));
+    const seenUrl = await stateGet(env, "seen:v" + revision + ":u:" + urlKey);
+    const seenTitle = await stateGet(env, "seen:v" + revision + ":t:" + titleKey);
+    if (seenUrl || seenTitle) await stateCall(stub, { op: "delete", key: "social:pending:" + item.id });
+  }
+}
+
 async function sendSourcesMenu(env: Env, chatId: number | string, page = 0) {
   const sources = await getFeedSources(env);
   const pageSize = 8;
@@ -1238,6 +1415,7 @@ async function sendSourcesMenu(env: Env, chatId: number | string, page = 0) {
     ];
   });
   rows.push([{ text: "➕ افزودن منبع RSS/Atom", callback_data: "source:add" }]);
+  rows.push([{ text: "📡 مدیریت حساب‌ها و کانال‌های اجتماعی", callback_data: "social:menu" }]);
   const nav: Array<{text: string; callback_data: string}> = [];
   if (currentPage > 0) nav.push({ text: "⬅️ قبلی", callback_data: "source:list:" + (currentPage - 1) });
   if (currentPage < maxPage) nav.push({ text: "بعدی ➡️", callback_data: "source:list:" + (currentPage + 1) });
@@ -1318,6 +1496,50 @@ async function handleAdminCallback(env: Env, query: any) {
   if (!env.ADMIN_TELEGRAM_ID || fromId !== env.ADMIN_TELEGRAM_ID || query.message?.chat?.type !== "private") { await telegramAnswerCallback(env, query.id, "دسترسی ادمین ندارید"); return; }
   await telegramAnswerCallback(env, query.id);
   if (data === "menu:sources") { await sendSourcesMenu(env, chatId); return; }
+  if (data === "social:menu") { await sendSocialSourcesMenu(env, chatId); return; }
+  if (data === "social:add") {
+    await statePut(env, "telegram:awaiting_social_source:" + fromId, "1", 900);
+    await telegramReply(env, chatId,
+      "📡 <b>افزودن حساب یا کانال اجتماعی</b>\n\n" +
+      "یکی از قالب‌های زیر را بفرست:\n" +
+      "• تلگرام: <code>telegram | @channel</code>\n" +
+      "• ایکس: <code>x | @handle | https://.../rss</code>\n" +
+      "• تروث سوشال: <code>truthsocial | @handle | https://.../rss</code>\n\n" +
+      "برای X و Truth Social باید لینک RSS/Atom قابل‌دسترسی از یک bridge وارد کنی؛ صرفِ شناسه به‌تنهایی دسترسی رسمی ایجاد نمی‌کند.\n" +
+      "برای تلگرام، بات باید در کانال عمومی ادمین باشد تا پست‌های جدید را دریافت کند.\n\nبرای لغو /cancel را بفرست.");
+    return;
+  }
+  if (data.startsWith("social:page:")) { await sendSocialSourcesMenu(env, chatId, Number(data.slice("social:page:".length)) || 0); return; }
+  if (data.startsWith("social:toggle:")) {
+    const id = data.slice("social:toggle:".length);
+    const sources = await getSocialSources(env);
+    const source = sources.find(item => item.id === id);
+    if (!source) { await telegramReply(env, chatId, "این حساب یا کانال پیدا نشد."); return; }
+    source.enabled = !source.enabled;
+    await saveSocialSources(env, sources);
+    await sendSocialSourcesMenu(env, chatId);
+    return;
+  }
+  if (data.startsWith("social:delete:")) {
+    const id = data.slice("social:delete:".length);
+    const sources = await getSocialSources(env);
+    const source = sources.find(item => item.id === id);
+    if (!source) { await telegramReply(env, chatId, "این حساب یا کانال پیدا نشد."); return; }
+    await statePut(env, "telegram:pending_social_delete:" + fromId, id, 600);
+    await telegramReply(env, chatId, "🗑 <b>حذف منبع اجتماعی؟</b>\n\n" + escapeHtml(source.platform + " | @" + source.handle) + "\nاین کار فقط منبع را از فهرست دریافت حذف می‌کند.", { inline_keyboard: [[{ text: "🗑 بله، حذف شود", callback_data: "social:confirmdelete:" + id }], [{ text: "لغو", callback_data: "social:menu" }]] });
+    return;
+  }
+  if (data.startsWith("social:confirmdelete:")) {
+    const id = data.slice("social:confirmdelete:".length);
+    if (await stateGet(env, "telegram:pending_social_delete:" + fromId) !== id) { await telegramReply(env, chatId, "درخواست حذف منقضی شده؛ دوباره تلاش کن."); return; }
+    const sources = await getSocialSources(env);
+    const updated = sources.filter(item => item.id !== id);
+    if (updated.length === sources.length) { await telegramReply(env, chatId, "منبع قبلاً حذف شده است."); return; }
+    await saveSocialSources(env, updated);
+    await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "telegram:pending_social_delete:" + fromId });
+    await sendSocialSourcesMenu(env, chatId);
+    return;
+  }
   if (data === "menu:editorial") { await editorialMenu(env, chatId); return; }
   if (data === "menu:diagnostics") { await sendDiagnostics(env, chatId); return; }
   if (data === "queue:list") { await sendReviewQueue(env, chatId); return; }
