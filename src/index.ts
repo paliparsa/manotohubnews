@@ -1156,7 +1156,7 @@ async function handleAdminCallback(env: Env, query: any) {
       }
     } else {
       const firstUrl = Array.isArray(pending.supporting) ? String(pending.supporting[0] || "") : "";
-      if (firstUrl && /^https?:\\/\\//i.test(firstUrl)) {
+      if (firstUrl && /^https?:\/\//i.test(firstUrl)) {
         const itemKey = await hashKey(normalizeUrl(firstUrl) + "|" + normalizeTitle(String(pending.headline || "")));
         await statePut(env, "rejected:" + itemKey, JSON.stringify({id:postKey,title:String(pending.headline||"").slice(0,300),url:firstUrl,source:new URL(firstUrl).hostname,domain:new URL(firstUrl).hostname,publishedAt:"",snippet:"",feedLanguage:"fa",reason:"admin_rejected",detail:"خبر توسط ادمین رد شد",rejectedAt:new Date().toISOString(),filterRevision:await getFilterRevision(env)}),60*60*24*14);
       }
