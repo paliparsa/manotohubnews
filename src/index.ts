@@ -632,7 +632,7 @@ async function getFreeModelCatalog(env: Env): Promise<Array<{id:string;name:stri
   } catch {}
   const byId = new Map<string, {id:string;name:string;role:string}>(MODEL_CATALOG.map(m => [m.id, m]));
   try {
-    const response = await fetch("https://openrouter.ai/api/v1/models", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10000) });
+    const response = await fetch("https://openrouter.ai/api/v1/models", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(2500) });
     if (response.ok) {
       const data: any = await response.json();
       for (const model of Array.isArray(data?.data) ? data.data : []) {
@@ -1049,7 +1049,7 @@ async function searchTopicAndSendCandidates(env: Env, chatId: number | string, q
   await telegramReply(env, chatId, "🌐 دارم مستقیماً در وب جست‌وجو می‌کنم؛ منابع مختلف را بررسی و خبرهای تکراری را ادغام می‌کنم. این جست‌وجو به RSS محدود نیست. کمی صبر کن…");
   try {
     const order = await getModelOrder(env);
-    const models = [...new Set([...order, ...(await getFreeModelCatalog(env)).map(m => m.id)])];
+    const models = [...new Set([...order, ...(await getFreeModelCatalog(env)).map(m => m.id)])].slice(0, 2);
     const prompt = "درخواست جست‌وجوی خبری کاربر: " + topic + "\nمستقیماً با ابزار جست‌وجوی وب، چند جست‌وجوی متفاوت و مرتبط انجام بده؛ فقط به RSS یا فهرست ثابتی از منابع محدود نشو. برای موضوع خبری تازه، خبرگزاری‌ها، منابع رسمی و گزارش‌های معتبر در زبان‌های مرتبط را بررسی کن. تا جایی که نتایج وب اجازه می‌دهد حداکثر 8 رویداد مهم و متمایز را پیدا کن؛ خبرهای تکراری درباره یک رویداد را ادغام کن. برای هر رویداد فقط URL واقعی‌ای را به‌عنوان منبع بیاور که در نتایج جست‌وجوی وب واقعاً دیده‌ای؛ URL، عنوان منبع، تاریخ انتشار یا جزئیات را حدس نزن. اگر صفحه/زمان انتشار روشن نیست، مقدار را خالی بگذار. به ادعاهای متناقض اشاره کن و گفته‌های طرف‌های درگیر را به خودشان نسبت بده. خلاصه‌ها را به فارسی، بی‌طرفانه و با تاریخ رویداد/انتشار فقط در صورت وجود شواهد بنویس. خروجی فقط JSON array باشد، بدون Markdown و متن اضافه. هر عضو: {relevant:boolean, headline:string, summary:string, status:'تأییدشده'|'گزارش اولیه'|'در حال بررسی', confidence:number, sources:[{title:string,url:string,domain:string,publishedAt:string}], reason:string, category:string}. هر خبر باید حداقل یک منبع با URL معتبر داشته باشد؛ ترجیحاً دو منبع مستقل. اگر جست‌وجوی وب نتیجهٔ کافی نداد، آرایهٔ خالی بده و چیزی نساز.";
     const errors: string[] = [];
     let posts: Array<AiPost & { sources: Array<{title:string;url:string;domain:string;publishedAt:string}> }> | null = null;
@@ -1069,7 +1069,7 @@ async function searchTopicAndSendCandidates(env: Env, chatId: number | string, q
             temperature: 0.15,
             max_tokens: 6500
           }),
-          signal: AbortSignal.timeout(90000)
+          signal: AbortSignal.timeout(10000)
         });
         const raw = await response.text();
         if (!response.ok) { errors.push(model + ": HTTP " + response.status + " " + raw.slice(0,100)); continue; }
@@ -1096,7 +1096,7 @@ async function searchTopicAndSendCandidates(env: Env, chatId: number | string, q
             topic: "manual_search",
             sources
           };
-        }).filter((p: any) => p.relevant && p.headline && p.summary && p.sources.length > 0).slice(0,8);
+        }).filter((p: any) => p.relevant && p.headline && p.summary && p.sources.length > 0).slice(0,3);
         await statePut(env, "status:last_model", model, 60 * 60 * 24 * 14);
         break;
       } catch (e) { errors.push(model + ": " + (e instanceof Error ? e.message.slice(0,120) : "error")); }
