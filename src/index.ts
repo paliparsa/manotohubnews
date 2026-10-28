@@ -290,6 +290,11 @@ async function stateCall(stub: DurableObjectStub, body: Record<string, unknown>)
   if (!response.ok) throw new Error(`State store failed: ${response.status}`);
   return response.json();
 }
+async function stateList(env: Env, prefix: string, limit = 30): Promise<Array<{key:string;value:string}>> {
+  const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
+  const result = await stateCall(stub, { op: "list", prefix, limit });
+  return Array.isArray(result.entries) ? result.entries.filter((x:any)=>x && typeof x.key === "string" && typeof x.value === "string") : [];
+}
 async function stateGet(env: Env, key: string): Promise<string | null> {
   const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
   const result = await stateCall(stub, { op: "get", key });
@@ -310,6 +315,15 @@ export class NewsState {
     const body = await request.json() as { op?: string; key?: string; value?: string; ttl?: number };
     const key = String(body.key || "");
     if (!key || key.length > 500) return Response.json({ ok: false, error: "invalid_key" }, { status: 400 });
+    if (body.op === "list") {
+      const prefix = String((body as any).prefix || "");
+      if (!prefix || prefix.length > 450) return Response.json({ ok: false, error: "invalid_prefix" }, { status: 400 });
+      const limit = Math.max(1, Math.min(Number((body as any).limit) || 30, 100));
+      const rows = await this.ctx.storage.list<{ value: string; expiresAt: number }>({ prefix, limit });
+      const now = Date.now(); const entries: Array<{ key: string; value: string }> = [];
+      for (const [k, row] of rows) { if (row.expiresAt && row.expiresAt < now) { await this.ctx.storage.delete(k); continue; } entries.push({ key: k, value: row.value }); }
+      return Response.json({ ok: true, entries });
+    }
     if (body.op === "get") {
       const row = await this.ctx.storage.get<{ value: string; expiresAt: number }>(key);
       if (!row) return Response.json({ ok: true, value: null });
@@ -418,7 +432,8 @@ function confidenceThreshold(sensitivity: EditorialSettings["sensitivity"]): num
 async function recordRejected(env: Env, item: NewsItem, reason: string, detail: string, revision: string): Promise<void> {
   const itemKey = await hashKey(normalizeUrl(item.url) + "|" + normalizeTitle(item.title));
   await statePut(env, "rejected:" + itemKey, JSON.stringify({
-    id: item.id, title: item.title.slice(0, 300), url: item.url, source: item.source,
+    id: item.id, title: item.title.slice(0, 300), url: item.url, source: item.source, domain: item.domain,
+    publishedAt: item.publishedAt, snippet: item.snippet, feedLanguage: item.feedLanguage,
     reason, detail: detail.slice(0, 240), rejectedAt: new Date().toISOString(), filterRevision: revision
   }), 60 * 60 * 24 * 14);
 }
@@ -791,6 +806,7 @@ function mainMenuKeyboard() {
     [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "📣 تنظیم انتشار", callback_data: "menu:publishing" }],
     [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }],
     [{ text: "📈 گزارش اجرا", callback_data: "menu:diagnostics" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
+    [{ text: "🧾 صف تأیید و بازبینی", callback_data: "queue:list" }, { text: "🧪 تست فیلترها", callback_data: "dryrun:start" }],
     [{ text: "🔎 جست‌وجوی خبر با موضوع دلخواه", callback_data: "topicsearch:start" }],
     [{ text: "🔌 آزمایش اتصال", callback_data: "menu:test" }, { text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }],
     [{ text: "🗑 حذف کلید", callback_data: "menu:delkey" }]
