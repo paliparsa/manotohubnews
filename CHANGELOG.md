@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.14.0 — 2026-10-28
+- Restore the missing five-minute Cron handler: each scheduled event now awaits the RSS → AI curation → publication pipeline and logs start, result, and unhandled failure.
+- Bound scheduled AI curation to three free-model attempts with a 25-second per-model timeout, avoiding long sequential stalls.
+- Reject empty or incomplete AI outputs instead of silently accepting relevant stories without Persian headlines/summaries or source IDs, then try another free model.
+- Ask for at most eight concise Persian summaries per run and cap output tokens to reduce truncated JSON and partially translated posts.
+
+
 ## 1.13.2 — 2026-10-28
 - Fix manual web search appearing to hang: try at most two free models with a 10-second per-model timeout instead of serially trying the entire free catalog for up to 90 seconds per model.
 - Shorten free-model catalog discovery timeout to 2.5 seconds so webhook background work is less likely to be terminated before a reply is sent.
