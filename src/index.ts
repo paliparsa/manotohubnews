@@ -1023,6 +1023,10 @@ async function handleAdminCallback(env: Env, query: any) {
   if (data === "menu:sources") { await sendSourcesMenu(env, chatId); return; }
   if (data === "menu:editorial") { await editorialMenu(env, chatId); return; }
   if (data === "menu:diagnostics") { await sendDiagnostics(env, chatId); return; }
+  if (data === "queue:list") { await sendReviewQueue(env, chatId); return; }
+  if (data === "rejected:list") { await sendRejectedQueue(env, chatId); return; }
+  if (data.startsWith("rejected:retry:")) { await retryRejectedItem(env, chatId, data.slice("rejected:retry:".length)); return; }
+  if (data === "dryrun:start") { await runDryRun(env, chatId); return; }
   if (data === "topics:add") {
     await statePut(env, "telegram:awaiting_topic_add:" + fromId, "1", 600);
     await telegramReply(env, chatId, "➕ <b>افزودن حوزهٔ خبری</b>\n\nنام حوزه را بفرست؛ می‌توانی بعد از علامت | کلمات کلیدی فارسی/انگلیسی را هم اضافه کنی.\nمثال: <code>بازی‌های ویدیویی | بازی، گیم، gaming، PlayStation، Xbox</code>\n\nبرای لغو /cancel را بفرست.");
@@ -1138,10 +1142,17 @@ async function handleAdminCallback(env: Env, query: any) {
     let pending: any;
     try { pending = JSON.parse(raw); } catch { await telegramReply(env, chatId, "اطلاعات پیش‌نویس قابل خواندن نیست.", mainMenuKeyboard()); return; }
     if (approve) {
-      await telegramSend(env, String(pending.message || ""));
-      await statePut(env, `posted:${postKey}`, JSON.stringify({ at: new Date().toISOString(), headline: pending.headline, supporting: pending.supporting || [], approvedBy: fromId }), 60 * 60 * 24 * 30);
-      await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: `pending:${postKey}` });
-      await telegramReply(env, chatId, `✅ خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» در کانال منتشر شد.`, mainMenuKeyboard());
+      try {
+        await telegramSend(env, String(pending.message || ""));
+        await statePut(env, `posted:${postKey}`, JSON.stringify({ at: new Date().toISOString(), headline: pending.headline, supporting: pending.supporting || [], approvedBy: fromId }), 60 * 60 * 24 * 30);
+        await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: `pending:${postKey}` });
+        await telegramReply(env, chatId, `✅ خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» در کانال منتشر شد.`, mainMenuKeyboard());
+      } catch (error) {
+        pending.status = "publish_error"; pending.retryCount = Number(pending.retryCount || 0) + 1; pending.lastError = error instanceof Error ? error.message.slice(0,240) : "خطای نامشخص"; pending.lastAttemptAt = new Date().toISOString();
+        await statePutPermanent(env, `pending:${postKey}`, JSON.stringify(pending));
+        console.error("manual_publish_failed", JSON.stringify({postKey,error:pending.lastError,retryCount:pending.retryCount}));
+        await telegramReply(env, chatId, "❌ انتشار ناموفق بود؛ خبر از صف حذف نشد و امکان تلاش مجدد وجود دارد.\nخطا: "+escapeHtml(pending.lastError), {inline_keyboard:[[{text:"🔁 تلاش مجدد",callback_data:"publish:"+postKey}],[{text:"🧾 بازگشت به صف",callback_data:"queue:list"}]]});
+      }
     } else {
       await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: `pending:${postKey}` });
       await telegramReply(env, chatId, `🗑 خبر «${escapeHtml(String(pending.headline || "").slice(0, 160))}» رد شد و منتشر نمی‌شود.`, mainMenuKeyboard());
