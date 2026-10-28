@@ -1190,8 +1190,9 @@ async function sendPublishingSettings(env: Env, chatId: number | string) {
   const descriptions: Record<PublishingMode,string> = {auto:"خبرهای واجد شرایط مستقیم در کانال منتشر می‌شوند.",approval:"هر خبر پیش از انتشار به صف تأیید تو می‌رود.",save_only:"خبرها آماده و در صف ذخیره می‌شوند؛ انتشار خودکار ندارند و می‌توانی بعداً دستی بررسی‌شان کنی.",paused:"جمع‌آوری و آماده‌سازی ادامه دارد؛ انتشار متوقف است و خبرهای آماده در صف قابل‌بازیابی ذخیره می‌شوند."};
   await telegramReply(env, chatId, "<b>📣 سیاست انتشار خبر</b>\n\nحالت فعلی: <b>"+labels[settings.mode]+"</b>\n\n"+descriptions[settings.mode]+"\n\nاین تنظیم مستقل از فیلتر موضوعات است؛ توقف انتشار، جمع‌آوری و آماده‌سازی را متوقف نمی‌کند.", publishingKeyboard(settings));
 }
-function modelsKeyboard(order: string[]) {
-  const rows: Array<Array<{text: string; callback_data: string}>> = order.map((id, i) => [{ text: (i === 0 ? "✅ " : "") + (i + 1) + ". " + ((await getFreeModelCatalog(env)).find(m => m.id === id)?.name || id), callback_data: "model:" + i }]);
+async function modelsKeyboard(env: Env, order: string[]) {
+  const catalog = await getFreeModelCatalog(env);
+  const rows: Array<Array<{text: string; callback_data: string}>> = order.map((id, i) => [{ text: (i === 0 ? "✅ " : "") + (i + 1) + ". " + (catalog.find(m => m.id === id)?.name || id), callback_data: "model:" + i }]);
   rows.push([{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]);
   return { inline_keyboard: rows };
 }
@@ -1350,7 +1351,7 @@ async function handleAdminCallback(env: Env, query: any) {
   }
   if (data === "menu:home") { await telegramReply(env, chatId, "<b>📰 پنل مدیریت خبرخوان</b>\n\nیک گزینه را انتخاب کن.", mainMenuKeyboard()); return; }
   if (data === "menu:status") { const key = await stateGet(env, "config:openrouter_key"); const model = await stateGet(env, "status:last_model") || "هنوز استفاده نشده"; const order = await getModelOrder(env); await telegramReply(env, chatId, "<b>📊 وضعیت سیستم</b>\n\n🟢 Worker: فعال\n📣 کانال: " + escapeHtml(env.CHANNEL_ID || "@Manotohubir") + "\n🔐 OpenRouter: " + (key ? "ثبت و رمزگذاری شده" : "ثبت نشده") + "\n🧠 مدل اصلی: <code>" + escapeHtml(order[0]) + "</code>\n🕘 آخرین مدل موفق: <code>" + escapeHtml(model) + "</code>\n⏱ انتشار خودکار: هر ۵ دقیقه", mainMenuKeyboard()); return; }
-  if (data === "menu:models") { const order = await getModelOrder(env); await telegramReply(env, chatId, "<b>🧠 انتخاب مدل اصلی</b>\n\nروی مدل دلخواه بزن؛ بقیه مدل‌ها به‌عنوان پشتیبان حفظ می‌شوند.", modelsKeyboard(order)); return; }
+  if (data === "menu:models") { const order = await getModelOrder(env); await telegramReply(env, chatId, "<b>🧠 انتخاب مدل اصلی</b>\n\nروی مدل دلخواه بزن؛ بقیه مدل‌ها به‌عنوان پشتیبان حفظ می‌شوند.", await modelsKeyboard(env, order)); return; }
   if (data.startsWith("model:")) { const index = Number(data.slice(6)); const order = await getModelOrder(env); if (!Number.isInteger(index) || index < 0 || index >= order.length) { await telegramReply(env, chatId, "انتخاب نامعتبر است.", mainMenuKeyboard()); return; } const chosen = order.splice(index, 1)[0]; order.unshift(chosen); await statePutPermanent(env, "config:model_order", JSON.stringify(order)); await telegramReply(env, chatId, "✅ مدل اصلی تغییر کرد به:\n<code>" + escapeHtml(chosen) + "</code>\nمدل‌های دیگر به‌عنوان پشتیبان حفظ شدند.", modelsKeyboard(order)); return; }
   if (data === "menu:setkey") { await statePut(env, "telegram:awaiting_openrouter_key:" + fromId, "1", 600); await telegramReply(env, chatId, "🔐 <b>ثبت یا تغییر کلید OpenRouter</b>\n\nکلید را در پیام بعدی بفرست. پیام کلید پس از دریافت، تا حد امکان حذف می‌شود و مقدار آن رمزگذاری خواهد شد.", mainMenuKeyboard()); return; }
   if (data === "menu:delkey") { await telegramReply(env, chatId, "<b>حذف کلید OpenRouter؟</b>\nبا تأیید، کلید ذخیره‌شده پاک می‌شود.", { inline_keyboard: [[{ text: "🗑 بله، حذف شود", callback_data: "confirm:delkey" }], [{ text: "لغو", callback_data: "menu:home" }]] }); return; }
