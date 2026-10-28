@@ -60,8 +60,8 @@ export default {
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
     // Telegram updates arrive instantly through the webhook; Cron is only for news publishing.
     const minute = new Date(controller.scheduledTime).getUTCMinutes();
-    if (minute % 5 === 0) ctx.waitUntil(runPipeline(env, "cron"));
-    if (minute % 15 === 0) ctx.waitUntil(runFocusedWebSearch(env));
+    // RSS discovery and free-tier model curation are the only scheduled news path.
+    // Paid Exa web search remains available only through an explicit admin/manual action.
   },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.12.0 — 2026-10-28
+- Stop running paid Exa web search automatically every 15 minutes; scheduled news discovery now uses RSS feeds only.
+- Keep RSS ingestion scheduled every five minutes and retain broad Iran/Islamic Republic, Reza Pahlavi and team, Israel, US relations, war and security coverage.
+- Keep the existing OpenRouter `:free` model catalog for curation and summaries; do not introduce paid-model fallbacks.
+- Preserve manual/admin-triggered web search as an optional action rather than a recurring cost.
+- Keep single-source preliminary reports and existing duplicate prevention/publication policies intact.
+
+
 ## 1.11.0 — 2026-10-28
 - Add automatic focused web search every 15 minutes for Iran, the Islamic Republic, Reza Pahlavi and his team, Israel, US relations, war and regional security; publish/queue results according to the existing publication policy.
 - Remove the two-independent-source rejection gate; single-source stories are kept and labeled as preliminary.
