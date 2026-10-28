@@ -147,15 +147,19 @@ async function runPipeline(env: Env, trigger: string) {
   const state = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
   if (!(await stateCall(state, { op: "acquire", key: lockKey, value: startedAt, ttl: 240 })).ok) return { ok: true, skipped: "another run appears active" };
   const stats: any = {
-    startedAt, trigger, status: "running", fetched: 0, earlyRejected: 0, examined: 0,
+    startedAt, trigger, status: "running", fetched: 0, feedSources: 0, feedItemsParsed: 0, earlyRejected: 0,
+    seenSkipped: 0, duplicateSkipped: 0, uniqueCandidates: 0, examined: 0,
     aiPosts: 0, published: 0, queued: 0, adminNotificationFailed: 0,
     rejectionReasons: {}, feedErrors: [], filterRevision: await getFilterRevision(env)
   };
   const countReason = (reason: string) => { stats.rejectionReasons[reason] = Number(stats.rejectionReasons[reason] || 0) + 1; };
   try {
     const settings = await getEditorialSettings(env);
+    const feedSources = (await getFeedSources(env)).filter(feed => feed.enabled);
+    stats.feedSources = feedSources.length;
     const fetched = await fetchFeeds(env);
     stats.fetched = fetched.length;
+    stats.feedItemsParsed = fetched.length;
     const feedErrorsRaw = await stateGet(env, "status:feed_errors");
     try { stats.feedErrors = JSON.parse(feedErrorsRaw || "[]"); } catch { stats.feedErrors = []; }
     const revision = stats.filterRevision;
@@ -165,7 +169,7 @@ async function runPipeline(env: Env, trigger: string) {
       const titleKey = await hashKey(normalizeTitle(item.title));
       const seenUrl = await stateGet(env, "seen:v" + revision + ":u:" + urlKey);
       const seenTitle = await stateGet(env, "seen:v" + revision + ":t:" + titleKey);
-      if (seenUrl || seenTitle) continue;
+      if (seenUrl || seenTitle) { stats.seenSkipped++; continue; }
       const searchable = normalizeFilterText(item.title + " " + item.snippet);
       const dateMs = Date.parse(item.publishedAt || "");
       if (settings.maxAgeHours > 0 && Number.isFinite(dateMs) && Date.now() - dateMs > settings.maxAgeHours * 3600000) {
@@ -184,11 +188,19 @@ async function runPipeline(env: Env, trigger: string) {
         await markSeen(env, item, revision); stats.earlyRejected++; countReason("خارج از فهرست کلمات مجاز");
         continue;
       }
+      if (unique.has(item.id)) { stats.duplicateSkipped++; continue; }
       unique.set(item.id, item);
     }
+    stats.uniqueCandidates = unique.size;
     const candidates = [...unique.values()].slice(0, clampInt(env.MAX_ITEMS_PER_RUN, 35, 1, 60));
     stats.examined = candidates.length;
     if (!candidates.length) {
+      stats.noCandidateReason = fetched.length === 0
+        ? "هیچ خبر معتبری از فیدهای فعال دریافت نشد؛ خطاهای فید را بررسی کن."
+        : stats.seenSkipped === fetched.length
+          ? "همهٔ خبرهای دریافت‌شده قبلاً در همین نسخهٔ فیلتر پردازش شده‌اند."
+          : "پس از حذف خبرهای دیده‌شده، تکراری‌ها و فیلترهای اولیه، خبر جدیدی برای بررسی باقی نماند.";
+      countReason(stats.noCandidateReason);
       stats.status = "complete";
       await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
       return { ok: true, trigger, fetched: fetched.length, candidates: 0, published: 0, queued: 0 };
@@ -482,9 +494,14 @@ async function sendDiagnostics(env: Env, chatId: number | string): Promise<void>
   const body = "<b>📊 گزارش سلامت خبرخوان</b>\n\n" +
     (run ? "<b>آخرین اجرا:</b> " + escapeHtml(String(run.startedAt || "—")) + "\n" +
       "وضعیت: " + escapeHtml(String(run.status || (run.ok === false ? "خطا" : "تمام‌شده"))) + "\n" +
-      "منابع/خبرهای دریافت‌شده: " + Number(run.fetched || 0) + "\n" +
+      "فیدهای فعال: " + Number(run.feedSources || 0) + "\n" +
+      "خبرهای دریافت‌شده: " + Number(run.fetched || 0) + "\n" +
+      "قبلاً بررسی‌شده: " + Number(run.seenSkipped || 0) + "\n" +
+      "تکراری داخل فیدها: " + Number(run.duplicateSkipped || 0) + "\n" +
+      "کاندیدای یکتا: " + Number(run.uniqueCandidates || 0) + "\n" +
       "فیلتر اولیه‌شده: " + Number(run.earlyRejected || 0) + "\n" +
       "ارسال به AI: " + Number(run.examined || 0) + "\n" +
+      (run.noCandidateReason ? "دلیل صفر بودن ورودی AI: " + escapeHtml(String(run.noCandidateReason)) + "\n" : "") +
       "خروجی‌های AI: " + Number(run.aiPosts || 0) + "\n" +
       "صف تأیید: " + Number(run.queued || 0) + "\n" +
       "منتشرشده: " + Number(run.published || 0) + "\n" +
@@ -518,10 +535,24 @@ async function saveFeedSources(env: Env, sources: FeedSource[]): Promise<void> {
 async function fetchFeeds(env: Env): Promise<NewsItem[]> {
   const sources = (await getFeedSources(env)).filter(feed => feed.enabled);
   const results = await Promise.allSettled(sources.map(async feed => {
-    const response = await fetch(feed.url, { headers: { "user-agent": "ManotohubirNewsBot/1.0 (RSS reader)", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(12000), redirect: "follow" });
-    if (!response.ok) throw new Error(`Feed ${new URL(feed.url).hostname} returned ${response.status}`);
-    const xml = await response.text();
-    return parseFeed(xml, feed.language);
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await fetch(feed.url, { headers: { "user-agent": "ManotohubirNewsBot/1.0 (RSS reader)", accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(12000), redirect: "follow" });
+        if (!response.ok) {
+          const retryable = response.status === 429 || [500, 502, 503, 504].includes(response.status);
+          if (retryable && attempt < 2) { await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1))); continue; }
+          throw new Error(`Feed ${new URL(feed.url).hostname} returned ${response.status} after ${attempt + 1} attempt(s)`);
+        }
+        const xml = await response.text();
+        return parseFeed(xml, feed.language);
+      } catch (error) {
+        lastError = error;
+        if (attempt >= 2) break;
+        await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error("Feed request failed after 3 attempts");
   }));
   const errors = results.flatMap((r, i) => r.status === "rejected" ? [sources[i].url + ": " + String(r.reason).slice(0, 180)] : []);
   await statePut(env, "status:feed_errors", JSON.stringify(errors.slice(0, 20)), 60 * 60 * 24);
