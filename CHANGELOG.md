@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.10.0 — 2026-10-28
+- Replace manual topic search's Google News RSS dependency with OpenRouter's `openrouter:web_search` server tool.
+- Let the model run multiple web searches across online sources, synthesize up to eight distinct stories, and return source links with each candidate.
+- Keep manual search separate from scheduled RSS ingestion; stories remain pending until the admin explicitly approves publication.
+- Update Telegram copy to explain web search coverage and limitations.
+
+
 ## 1.9.1 — 2026-10-28
 - Explain why no stories reach AI by tracking previously seen items, duplicate feed items, unique candidates, and the no-candidate reason in diagnostics.
 - Add bounded retries for transient feed HTTP errors (429/500/502/503/504) and temporary fetch failures.
