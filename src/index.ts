@@ -605,7 +605,20 @@ function safeDate(value: string): string {
 }
 
 const MODEL_CATALOG = [
-  { id: "openrouter/free", name: "OpenRouter Free Router", role: "مسیریاب پویای مدل‌های رایگان" }
+  { id: "google/gemma-4-31b-it:free", name: "Gemma 4 31B", role: "مدل رایگان عمومی" },
+  { id: "nvidia/nemotron-3.5-lightning:free", name: "Nemotron 3.5 Lightning", role: "مدل رایگان سریع" },
+  { id: "nvidia/nemotron-3.5-super-vl:free", name: "Nemotron 3.5 Super VL", role: "مدل رایگان چندمنظوره" },
+  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", name: "Nemotron 3 Nano Omni", role: "مدل رایگان چندمنظوره" },
+  { id: "minimax/minimax-m3.1-flash:free", name: "MiniMax M3.1 Flash", role: "مدل رایگان سریع" },
+  { id: "xingchen-agi/xing4.0-29b-a4b:free", name: "Xing4.0 29B", role: "مدل رایگان عمومی" },
+  { id: "thinkingmachines/inkling:free", name: "Inkling", role: "مدل رایگان عمومی" },
+  { id: "thinkingmachines/inkling-small:free", name: "Inkling Small", role: "مدل رایگان سبک" },
+  { id: "dots-studio/dots-3-note-preview:free", name: "Dots 3 Note", role: "مدل رایگان عمومی" },
+  { id: "recursive/flint-v1.0:free", name: "Flint v1.0", role: "مدل رایگان عمومی" },
+  { id: "liquid/lfm-2.5-2.6b:free", name: "Liquid LFM 2.5", role: "مدل رایگان سبک" },
+  { id: "cohere/north-mini-code:free", name: "Cohere North Mini Code", role: "مدل رایگان" },
+  { id: "poolside/laguna-s-2.1:free", name: "Laguna S 2.1", role: "مدل رایگان آزمایشی" },
+  { id: "poolside/laguna-xs-2.1:free", name: "Laguna XS 2.1", role: "مدل رایگان سبک" }
 ];
 
 async function getFreeModelCatalog(env: Env): Promise<Array<{id:string;name:string;role:string}>> {
@@ -614,7 +627,7 @@ async function getFreeModelCatalog(env: Env): Promise<Array<{id:string;name:stri
     const cached = await stateGet(env, cacheKey);
     if (cached) {
       const parsed = JSON.parse(cached);
-      if (Array.isArray(parsed) && parsed.some((m: any) => m?.id === "openrouter/free")) return parsed;
+      if (Array.isArray(parsed) && parsed.length) return parsed.filter((m: any) => !String(m?.id || "").startsWith("nvidia/nemotron-3-ultra-550b-a55b"));
     }
   } catch {}
   const byId = new Map<string, {id:string;name:string;role:string}>(MODEL_CATALOG.map(m => [m.id, m]));
@@ -626,7 +639,7 @@ async function getFreeModelCatalog(env: Env): Promise<Array<{id:string;name:stri
         const id = String(model?.id || "");
         const pricing = model?.pricing || {};
         const modalities = model?.architecture?.output_modalities;
-        const isFreeTextModel = id.endsWith(":free") &&
+        const isFreeTextModel = id.endsWith(":free") && !id.startsWith("nvidia/nemotron-3-ultra-550b-a55b") &&
           Number(pricing.prompt) === 0 && Number(pricing.completion) === 0 &&
           (!Array.isArray(modalities) || modalities.includes("text"));
         if (!isFreeTextModel) continue;

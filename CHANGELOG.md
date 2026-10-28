@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.13.1 — 2026-10-28
+- Explicitly exclude NVIDIA Nemotron 3 Ultra from both discovered and fallback model lists, as requested.
+- Remove the free router that could randomly select the excluded model; use explicit `:free` endpoints only.
+- Keep dynamic discovery of all other zero-priced OpenRouter text models and legacy paid-model preference rejection.
+
+
 ## 1.13.0 — 2026-10-28
 - Remove any possibility of choosing or falling back to a paid model: model selection only accepts OpenRouter's explicit `:free` variants plus the free `openrouter/free` router.
 - Discover the current OpenRouter free text-model catalog dynamically, cache it for 12 hours, and include newly available free models without requiring code edits.
