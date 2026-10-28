@@ -1159,6 +1159,114 @@ async function handleAdminCallback(env: Env, query: any) {
   await telegramReply(env, chatId, "گزینه ناشناخته است. از منوی اصلی استفاده کن.", mainMenuKeyboard());
 }
 
+async function sendReviewQueue(env: Env, chatId: number | string): Promise<void> {
+  const entries = await stateList(env, "pending:", 40);
+  const rows: Array<Array<{text:string;callback_data:string}>> = [];
+  const lines: string[] = [];
+  for (const entry of entries.slice(0, 12)) {
+    try {
+      const p:any = JSON.parse(entry.value);
+      const id = entry.key.slice("pending:".length);
+      const status = p.status === "publish_error" ? "❌ خطای انتشار" : "📝 منتظر بررسی";
+      lines.push("• <b>"+escapeHtml(String(p.headline || "بدون تیتر").slice(0,120))+"</b>\n  "+status+(p.lastError ? "\n  خطا: "+escapeHtml(String(p.lastError).slice(0,120)) : ""));
+      rows.push([{text:"📣 انتشار",callback_data:"publish:"+id},{text:"🗑 رد",callback_data:"skip:"+id}]);
+    } catch {}
+  }
+  rows.push([{text:"🧾 خبرهای ردشده",callback_data:"rejected:list"},{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]);
+  await telegramReply(env,chatId,"<b>🧾 صف تأیید و بازیابی</b>\n\n"+(lines.join("\n\n") || "صف خبرهای آماده خالی است.")+"\n\nتعداد موارد نمایش‌داده‌شده: "+lines.length, {inline_keyboard:rows});
+}
+async function sendRejectedQueue(env: Env, chatId: number | string): Promise<void> {
+  const entries = await stateList(env,"rejected:",60);
+  const parsed = entries.map(e=>{try{return {key:e.key.slice("rejected:".length),item:JSON.parse(e.value)};}catch{return null;}}).filter((x:any)=>x && x.item && x.item.title).sort((a:any,b:any)=>String(b.item.rejectedAt||"").localeCompare(String(a.item.rejectedAt||"")));
+  const rows: Array<Array<{text:string;callback_data:string}>> = [];
+  const lines:string[]=[];
+  for(const entry of parsed.slice(0,10)){
+    const item=entry.item;
+    lines.push("• <b>"+escapeHtml(String(item.title).slice(0,130))+"</b>\n  دلیل: "+escapeHtml(String(item.detail || item.reason || "نامشخص").slice(0,180))+"\n  زمان: "+escapeHtml(String(item.rejectedAt || "—")));
+    rows.push([{text:"🔁 بازپردازش این خبر",callback_data:"rejected:retry:"+entry.key}]);
+  }
+  rows.push([{text:"⬅️ صف تأیید",callback_data:"queue:list"},{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]);
+  await telegramReply(env,chatId,"<b>🗂 خبرهای ردشده و قابل بازبینی</b>\n\n"+(lines.join("\n\n") || "خبر ردشده‌ای در بازهٔ نگهداری پیدا نشد.")+"\n\nفقط ۱۰ مورد آخر از حداکثر "+parsed.length+" مورد نمایش داده می‌شود. بازپردازش از فیلترهای فعلی عبور می‌کند و به‌تنهایی چیزی منتشر نمی‌کند.",{inline_keyboard:rows});
+}
+async function retryRejectedItem(env: Env, chatId: number | string, itemKey: string): Promise<void> {
+  if(!/^[a-f0-9]{1,64}$/i.test(itemKey)){await telegramReply(env,chatId,"شناسهٔ خبر نامعتبر است.");return;}
+  const raw=await stateGet(env,"rejected:"+itemKey);
+  if(!raw){await telegramReply(env,chatId,"این رکورد منقضی شده یا قبلاً پاک شده است.",{inline_keyboard:[[{text:"🗂 خبرهای ردشده",callback_data:"rejected:list"}]]});return;}
+  let saved:any;try{saved=JSON.parse(raw);}catch{await telegramReply(env,chatId,"رکورد خبر قابل خواندن نیست.");return;}
+  if(!saved.url || !/^https?:\/\//i.test(saved.url)){await telegramReply(env,chatId,"این رکورد لینک معتبر برای بازپردازش ندارد.");return;}
+  const item:NewsItem={id:String(saved.id||itemKey),title:String(saved.title||""),url:String(saved.url),source:String(saved.source||new URL(saved.url).hostname),domain:String(saved.domain||new URL(saved.url).hostname),publishedAt:String(saved.publishedAt||""),snippet:String(saved.snippet||""),feedLanguage:String(saved.feedLanguage||"fa")};
+  const settings=await getEditorialSettings(env);
+  const searchable=normalizeFilterText(item.title+" "+item.snippet);
+  if(settings.maxAgeHours>0 && item.publishedAt && Number.isFinite(Date.parse(item.publishedAt)) && Date.now()-Date.parse(item.publishedAt)>settings.maxAgeHours*3600000){await telegramReply(env,chatId,"هنوز رد می‌شود: خبر از بازهٔ زمانی فعلی قدیمی‌تر است.");return;}
+  const blocked=settings.blockKeywords.find(k=>searchable.includes(k));
+  if(blocked){await telegramReply(env,chatId,"هنوز رد می‌شود؛ کلمهٔ ممنوع فعلی: "+escapeHtml(blocked));return;}
+  if(settings.allowKeywords.length && !settings.allowKeywords.some(k=>searchable.includes(k))){await telegramReply(env,chatId,"هنوز رد می‌شود؛ هیچ کلمه‌ای از فهرست مجاز پیدا نشد.");return;}
+  await telegramReply(env,chatId,"⏳ خبر را با تنظیمات فعلی دوباره به AI می‌فرستم؛ انتشار خودکار انجام نمی‌شود.");
+  try{
+    const posts=await curateWithOpenRouter([item],env);
+    const post=posts.find(p=>p.relevant && p.headline && p.summary && p.supportingIds.includes(item.id));
+    const topics=await getEditorialTopics(env);
+    const topic=post && (topics.some(t=>t.id===post.topic)?String(post.topic):topicFromText(post.category+" "+post.headline+" "+post.summary,topics));
+    if(!post || !topic || topic==="other" || !settings.topics.includes(topic) || post.confidence<confidenceThreshold(settings.sensitivity)){
+      saved.reason="retry_still_rejected";saved.detail=!post?"مدل خبر را انتخاب نکرد":topic==="other"||!topic||!settings.topics.includes(topic)?"موضوع در فهرست فعال نیست":"اطمینان مدل پایین‌تر از آستانه است";saved.reprocessedAt=new Date().toISOString();
+      await statePut(env,"rejected:"+itemKey,JSON.stringify(saved),60*60*24*14);
+      await telegramReply(env,chatId,"خبر پس از بازپردازش هم از فیلترهای فعلی عبور نکرد.\nدلیل: "+escapeHtml(saved.detail),{inline_keyboard:[[{text:"🗂 خبرهای ردشده",callback_data:"rejected:list"}]]});return;
+    }
+    const sources=[{id:item.id,title:item.title,url:item.url,source:item.source,domain:item.domain,publishedAt:item.publishedAt,snippet:item.snippet,feedLanguage:item.feedLanguage}];
+    const sourceLine="• <a href=\""+escapeAttr(item.url)+"\">"+escapeHtml(item.source)+"</a>";
+    const message="📰 <b>"+escapeHtml(post.headline)+"</b>\n\n"+escapeHtml(post.summary)+"\n\n⚠️ <b>بازپردازش دستی؛ یک منبع، نیازمند بررسی</b>\n🏷️ <b>حوزه:</b> "+escapeHtml(post.category||topic)+"\n\n<b>منبع:</b>\n"+sourceLine+"\n\n@Manotohubir";
+    const postKey=await hashKey("retry|"+normalizeTitle(post.headline)+"|"+normalizeUrl(item.url));
+    const existing=await stateGet(env,"posted:"+postKey);
+    if(existing){await telegramReply(env,chatId,"خبر مشابه قبلاً منتشر شده؛ برای جلوگیری از تکرار به صف انتشار اضافه نشد.");return;}
+    await statePutPermanent(env,"pending:"+postKey,JSON.stringify({postKey,message,headline:post.headline,createdAt:new Date().toISOString(),supporting:sources.map(x=>x.url),status:"pending",retryCount:0,manualRetry:true}));
+    await telegramReply(env,chatId,message+"\n\n🔁 <b>بازپردازش موفق شد؛ انتشار نیازمند تأیید توست.</b>",{inline_keyboard:[[{text:"📣 تأیید و انتشار",callback_data:"publish:"+postKey},{text:"🗑 رد خبر",callback_data:"skip:"+postKey}],[{text:"🧾 صف بازبینی",callback_data:"queue:list"}]]});
+  }catch(error){const message=error instanceof Error?error.message:"خطای نامشخص";saved.retryError=message.slice(0,240);saved.retryAttemptAt=new Date().toISOString();await statePut(env,"rejected:"+itemKey,JSON.stringify(saved),60*60*24*14);console.error("rejected_item_retry_failed",JSON.stringify({itemKey,error:message}));await telegramReply(env,chatId,"❌ بازپردازش ناموفق بود؛ رکورد ردشده حفظ شد و می‌توانی دوباره تلاش کنی.\nخطا: "+escapeHtml(message.slice(0,180)),{inline_keyboard:[[{text:"🔁 تلاش مجدد",callback_data:"rejected:retry:"+itemKey}],[{text:"🗂 خبرهای ردشده",callback_data:"rejected:list"}]]});}
+}
+async function runDryRun(env: Env, chatId: number | string): Promise<void> {
+  await telegramReply(env,chatId,"🧪 در حال اجرای تست آزمایشی روی حداکثر ۳۰ خبر؛ هیچ چیزی در کانال منتشر یا به صف واقعی اضافه نمی‌شود.");
+  try{
+    const settings=await getEditorialSettings(env);
+    const fetched=(await fetchFeeds(env)).slice(0,90);
+    const sample=fetched.slice(0,30);
+    const counts:Record<string,number>={قبول:0,رد:0,"بررسی دستی":0,"فیلتر اولیه":0};
+    const reasons:Record<string,number>={};
+    const eligible:NewsItem[]=[];
+    const now=Date.now();
+    for(const item of sample){
+      const text=normalizeFilterText(item.title+" "+item.snippet);
+      const dt=Date.parse(item.publishedAt||"");
+      let reason="";
+      if(settings.maxAgeHours>0 && Number.isFinite(dt) && now-dt>settings.maxAgeHours*3600000) reason="قدیمی‌تر از بازه";
+      else if(settings.blockKeywords.some(k=>text.includes(k))) reason="کلمه ممنوع";
+      else if(settings.allowKeywords.length && !settings.allowKeywords.some(k=>text.includes(k))) reason="خارج از کلمات مجاز";
+      if(reason){counts["فیلتر اولیه"]++;reasons[reason]=(reasons[reason]||0)+1;}else eligible.push(item);
+    }
+    const candidates=eligible.slice(0,30);
+    let posts:AiPost[]=[];
+    if(candidates.length)posts=await curateWithOpenRouter(candidates,env);
+    const topics=await getEditorialTopics(env);
+    const active=new Set(settings.topics);
+    const handled=new Set<string>();
+    for(const post of posts){
+      const supporting=candidates.filter(x=>post.supportingIds.includes(x.id));
+      const topic=topics.some(t=>t.id===post.topic)?String(post.topic):topicFromText(post.category+" "+post.headline+" "+post.summary,topics);
+      let reason="";
+      if(!post.relevant||!post.headline||!post.summary)reason="نامرتبط از نظر AI";
+      else if(topic==="other"||!active.has(topic))reason="موضوع غیرفعال";
+      else if(post.confidence<confidenceThreshold(settings.sensitivity))reason="اطمینان پایین";
+      else if(!supporting.length)reason="منبع پشتیبان ندارد";
+      else if(post.status==="تأییدشده" && new Set(supporting.map(x=>x.domain)).size<2)reason="منابع ناکافی";
+      else if(supporting.length===1 || post.status!=="تأییدشده")counts["بررسی دستی"]++;
+      else counts["قبول"]++;
+      if(reason){counts["رد"]++;reasons[reason]=(reasons[reason]||0)+1;}
+      for(const item of supporting)handled.add(item.id);
+    }
+    for(const item of candidates)if(!handled.has(item.id)){counts["رد"]++;reasons["انتخاب‌نشده توسط AI"]=(reasons["انتخاب‌نشده توسط AI"]||0)+1;}
+    const out="<b>🧪 نتیجهٔ تست قوانین — بدون انتشار</b>\n\nنمونهٔ دریافت‌شده: "+sample.length+"\nعبورکرده از فیلتر اولیه: "+eligible.length+"\nارسال‌شده به AI: "+candidates.length+"\n\n✅ قبول: "+counts["قبول"]+"\n🟡 بررسی دستی: "+counts["بررسی دستی"]+"\n🔴 رد پس از AI: "+counts["رد"]+"\n⚪ رد در فیلتر اولیه: "+counts["فیلتر اولیه"]+"\n\n<b>دلایل:</b>\n"+(Object.entries(reasons).map(([k,v])=>escapeHtml(k)+": "+v).join("\n")||"بدون رد در این نمونه")+"\n\nاین یک شبیه‌سازی است؛ هیچ خبر منتشر یا به صف واقعی اضافه نشده است.";
+    await telegramReply(env,chatId,out,{inline_keyboard:[[{text:"🔁 اجرای دوباره",callback_data:"dryrun:start"},{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]]});
+  }catch(error){const msg=error instanceof Error?error.message:"خطای نامشخص";console.error("dry_run_failed",msg);await telegramReply(env,chatId,"❌ تست کامل نشد؛ هیچ خبری منتشر نشد.\nخطا: "+escapeHtml(msg.slice(0,220)),{inline_keyboard:[[{text:"🔁 تلاش دوباره",callback_data:"dryrun:start"}],[{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]]});}
+}
+
 async function getModelOrder(env: Env): Promise<string[]> {
   try {
     const parsed = JSON.parse(await stateGet(env, "config:model_order") || "[]");
