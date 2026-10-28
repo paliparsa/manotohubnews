@@ -70,7 +70,7 @@ export default {
       // self-healing: register the expected endpoint if missing/wrong, or force-refresh
       // when explicitly requested with ?setupWebhook=1. Never expose the bot token/secret.
       const webhook = await ensureTelegramWebhook(request.url, env, url.searchParams.get("setupWebhook") === "1");
-      return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", telegramTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN), adminIdConfigured: Boolean(env.ADMIN_TELEGRAM_ID), encryptionKeyConfigured: Boolean(env.CONFIG_ENCRYPTION_KEY), telegramMode: "webhook", webhookSecretConfigured: Boolean(env.TELEGRAM_WEBHOOK_SECRET), webhook, aiProvider: "OpenRouter", models: MODEL_CATALOG.map(m => m.id) });
+      return json({ ok: true, service: "manotohubir-news", channel: env.CHANNEL_ID, mode: "automatic", telegramTokenConfigured: Boolean(env.TELEGRAM_BOT_TOKEN), adminIdConfigured: Boolean(env.ADMIN_TELEGRAM_ID), encryptionKeyConfigured: Boolean(env.CONFIG_ENCRYPTION_KEY), telegramMode: "webhook", webhookSecretConfigured: Boolean(env.TELEGRAM_WEBHOOK_SECRET), webhook, aiProvider: "OpenRouter", models: (await getFreeModelCatalog(env)).map(m => m.id) });
     }
     if (url.pathname === "/telegram-webhook") {
       if (request.method !== "POST") return json({ ok: false, error: "method_not_allowed" }, 405);
@@ -605,20 +605,66 @@ function safeDate(value: string): string {
 }
 
 const MODEL_CATALOG = [
-  { id: "nvidia/nemotron-3-ultra-550b-a55b:free", name: "Nemotron 3 Ultra", role: "تحلیل چندمنبعی و پیچیده" },
-  { id: "nvidia/nemotron-3.5-lightning:free", name: "Nemotron 3.5 Lightning", role: "دسته‌بندی و پردازش سریع" },
-  { id: "nvidia/nemotron-3.5-super-vl:free", name: "Nemotron 3.5 Super VL", role: "مدل چندمنظوره و تحلیل اسناد" },
-  { id: "poolside/laguna-s-2.1:free", name: "Laguna S 2.1", role: "پشتیبان آزمایشی؛ رایگان بودن طبق اعلام فعلی تا ۳۱ اکتبر ۲۰۲۶" }
+  { id: "openrouter/free", name: "OpenRouter Free Router", role: "مسیریاب پویای مدل‌های رایگان" },
+  { id: "google/gemma-4-31b-it:free", name: "Gemma 4 31B", role: "مدل رایگان عمومی" },
+  { id: "nvidia/nemotron-3.5-lightning:free", name: "Nemotron 3.5 Lightning", role: "مدل رایگان سریع" },
+  { id: "nvidia/nemotron-3.5-super-vl:free", name: "Nemotron 3.5 Super VL", role: "مدل رایگان چندمنظوره" },
+  { id: "nvidia/nemotron-3-ultra-550b-a55b:free", name: "Nemotron 3 Ultra (free)", role: "مدل رایگان استدلالی" },
+  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", name: "Nemotron 3 Nano Omni", role: "مدل رایگان چندمنظوره" },
+  { id: "minimax/minimax-m3.1-flash:free", name: "MiniMax M3.1 Flash", role: "مدل رایگان سریع" },
+  { id: "xingchen-agi/xing4.0-29b-a4b:free", name: "Xing4.0 29B", role: "مدل رایگان عمومی" },
+  { id: "thinkingmachines/inkling:free", name: "Inkling", role: "مدل رایگان عمومی" },
+  { id: "thinkingmachines/inkling-small:free", name: "Inkling Small", role: "مدل رایگان سبک" },
+  { id: "dots-studio/dots-3-note-preview:free", name: "Dots 3 Note", role: "مدل رایگان عمومی" },
+  { id: "recursive/flint-v1.0:free", name: "Flint v1.0", role: "مدل رایگان عمومی" },
+  { id: "liquid/lfm-2.5-2.6b:free", name: "Liquid LFM 2.5", role: "مدل رایگان سبک" },
+  { id: "cohere/north-mini-code:free", name: "Cohere North Mini Code", role: "مدل رایگان" },
+  { id: "poolside/laguna-s-2.1:free", name: "Laguna S 2.1", role: "مدل رایگان آزمایشی" },
+  { id: "poolside/laguna-xs-2.1:free", name: "Laguna XS 2.1", role: "مدل رایگان سبک" }
 ];
+
+async function getFreeModelCatalog(env: Env): Promise<Array<{id:string;name:string;role:string}>> {
+  const cacheKey = "cache:openrouter-free-models";
+  try {
+    const cached = await stateGet(env, cacheKey);
+    if (cached) {
+      const parsed = JSON.parse(cached);
+      if (Array.isArray(parsed) && parsed.some((m: any) => m?.id === "openrouter/free")) return parsed;
+    }
+  } catch {}
+  const byId = new Map<string, {id:string;name:string;role:string}>(MODEL_CATALOG.map(m => [m.id, m]));
+  try {
+    const response = await fetch("https://openrouter.ai/api/v1/models", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(10000) });
+    if (response.ok) {
+      const data: any = await response.json();
+      for (const model of Array.isArray(data?.data) ? data.data : []) {
+        const id = String(model?.id || "");
+        const pricing = model?.pricing || {};
+        const modalities = model?.architecture?.output_modalities;
+        const isFreeTextModel = id.endsWith(":free") &&
+          Number(pricing.prompt) === 0 && Number(pricing.completion) === 0 &&
+          (!Array.isArray(modalities) || modalities.includes("text"));
+        if (!isFreeTextModel) continue;
+        byId.set(id, { id, name: String(model?.name || id).slice(0,100), role: "مدل رایگان OpenRouter" });
+      }
+    }
+  } catch (error) {
+    console.warn("free_model_catalog_fetch_failed", error instanceof Error ? error.message : String(error));
+  }
+  const catalog = [...byId.values()];
+  try { await statePut(env, cacheKey, JSON.stringify(catalog), 60 * 60 * 12); } catch {}
+  return catalog;
+}
 
 async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost[]> {
   const apiKey = await getOpenRouterKey(env);
   if (!apiKey) throw new Error("OpenRouter API key is not configured. Send /setkey YOUR_OPENROUTER_KEY to the bot privately as the configured admin.");
   const payload = items.map(({ id, title, url, source, domain, publishedAt, snippet, feedLanguage }) => ({ id, title, url, source, domain, publishedAt, snippet, feedLanguage }));
+  const catalog = await getFreeModelCatalog(env);
   const orderRaw = await stateGet(env, "config:model_order");
   let order: string[] = [];
-  try { const parsed = JSON.parse(orderRaw || "[]"); if (Array.isArray(parsed)) order = parsed.filter((x: unknown) => typeof x === "string" && MODEL_CATALOG.some(m => m.id === x)); } catch {}
-  const models = [...new Set([...order, ...MODEL_CATALOG.map(m => m.id)])];
+  try { const parsed = JSON.parse(orderRaw || "[]"); if (Array.isArray(parsed)) order = parsed.filter((x: unknown) => typeof x === "string" && catalog.some(m => m.id === x)); } catch {}
+  const models = [...new Set([...order, ...catalog.map(m => m.id)])];
   const editorial = await getEditorialSettings(env);
   const allTopics = await getEditorialTopics(env);
   const activeTopics = allTopics.filter(t => editorial.topics.includes(t.id));
@@ -833,7 +879,7 @@ async function handleAdminMessage(env: Env, message: any) {
   if (/^\/test(?:@\w+)?$/.test(text)) {
     const key = await getOpenRouterKey(env);
     if (!key) { await telegramReply(env, chatId, "اول کلید را ثبت کن: /setkey YOUR_OPENROUTER_KEY"); return; }
-    const model = (await getModelOrder(env))[0] || MODEL_CATALOG[0].id;
+    const model = (await getModelOrder(env))[0] || (await getFreeModelCatalog(env))[0]?.id || "openrouter/free";
     const result = await callOpenRouterTest(key, model);
     await telegramReply(env, chatId, result.ok ? `اتصال موفق است.\nمدل پاسخ داد: <code>${escapeHtml(model)}</code>` : `آزمایش ناموفق بود.\nمدل: <code>${escapeHtml(model)}</code>\nخطا: ${escapeHtml(result.error || "خطای نامشخص")}`);
     return;
@@ -912,7 +958,8 @@ async function runFocusedWebSearch(env: Env): Promise<void> {
     const apiKey = await getOpenRouterKey(env);
     if (!apiKey) throw new Error("OpenRouter API key is not configured");
     const order = await getModelOrder(env);
-    const models = [...new Set([...order, ...MODEL_CATALOG.map(m => m.id)])];
+    const catalog = await getFreeModelCatalog(env);
+    const models = [...new Set([...order.filter(id => catalog.some(m => m.id === id)), ...catalog.map(m => m.id)])];
     const prompt = "Search the live public web now in Persian and English, and when useful Hebrew, Arabic and Turkish. Find recent and developing news broadly related to: Iran and the Islamic Republic; the Iranian government and opposition; Crown Prince Reza Pahlavi, his team, coalition and statements; Israel; Iran-Israel relations; Iran-US and Israel-US relations; the US administration and Congress; war, military actions, threats, ceasefires, diplomacy, negotiations, sanctions, nuclear issues and regional security. Do not require multiple sources. Return up to 8 distinct news events with one or more real source URLs seen in search results. Include early reports and attributed claims, clearly label them as preliminary when based on one source or an unverified claim. Do not invent URLs, dates, quotes or facts. Merge only clear duplicates; do not drop relevant items just because confidence is imperfect. Prefer recent stories but include important developments from the last 7 days. Output ONLY a JSON array. Each item: {relevant:boolean,headline:string,summary:string,status:'تأییدشده'|'گزارش اولیه'|'در حال بررسی',confidence:number,sources:[{title:string,url:string,domain:string,publishedAt:string}],category:string}. Every item must have at least one valid source URL. If web search itself fails, report tool failure rather than fabricate news.";
     let posts: any[] | null = null;
     const errors: string[] = [];
@@ -1004,7 +1051,7 @@ async function searchTopicAndSendCandidates(env: Env, chatId: number | string, q
   await telegramReply(env, chatId, "🌐 دارم مستقیماً در وب جست‌وجو می‌کنم؛ منابع مختلف را بررسی و خبرهای تکراری را ادغام می‌کنم. این جست‌وجو به RSS محدود نیست. کمی صبر کن…");
   try {
     const order = await getModelOrder(env);
-    const models = [...new Set([...order, ...MODEL_CATALOG.map(m => m.id)])];
+    const models = [...new Set([...order, ...(await getFreeModelCatalog(env)).map(m => m.id)])];
     const prompt = "درخواست جست‌وجوی خبری کاربر: " + topic + "\nمستقیماً با ابزار جست‌وجوی وب، چند جست‌وجوی متفاوت و مرتبط انجام بده؛ فقط به RSS یا فهرست ثابتی از منابع محدود نشو. برای موضوع خبری تازه، خبرگزاری‌ها، منابع رسمی و گزارش‌های معتبر در زبان‌های مرتبط را بررسی کن. تا جایی که نتایج وب اجازه می‌دهد حداکثر 8 رویداد مهم و متمایز را پیدا کن؛ خبرهای تکراری درباره یک رویداد را ادغام کن. برای هر رویداد فقط URL واقعی‌ای را به‌عنوان منبع بیاور که در نتایج جست‌وجوی وب واقعاً دیده‌ای؛ URL، عنوان منبع، تاریخ انتشار یا جزئیات را حدس نزن. اگر صفحه/زمان انتشار روشن نیست، مقدار را خالی بگذار. به ادعاهای متناقض اشاره کن و گفته‌های طرف‌های درگیر را به خودشان نسبت بده. خلاصه‌ها را به فارسی، بی‌طرفانه و با تاریخ رویداد/انتشار فقط در صورت وجود شواهد بنویس. خروجی فقط JSON array باشد، بدون Markdown و متن اضافه. هر عضو: {relevant:boolean, headline:string, summary:string, status:'تأییدشده'|'گزارش اولیه'|'در حال بررسی', confidence:number, sources:[{title:string,url:string,domain:string,publishedAt:string}], reason:string, category:string}. هر خبر باید حداقل یک منبع با URL معتبر داشته باشد؛ ترجیحاً دو منبع مستقل. اگر جست‌وجوی وب نتیجهٔ کافی نداد، آرایهٔ خالی بده و چیزی نساز.";
     const errors: string[] = [];
     let posts: Array<AiPost & { sources: Array<{title:string;url:string;domain:string;publishedAt:string}> }> | null = null;
@@ -1159,7 +1206,7 @@ async function sendPublishingSettings(env: Env, chatId: number | string) {
   await telegramReply(env, chatId, "<b>📣 سیاست انتشار خبر</b>\n\nحالت فعلی: <b>"+labels[settings.mode]+"</b>\n\n"+descriptions[settings.mode]+"\n\nاین تنظیم مستقل از فیلتر موضوعات است؛ توقف انتشار، جمع‌آوری و آماده‌سازی را متوقف نمی‌کند.", publishingKeyboard(settings));
 }
 function modelsKeyboard(order: string[]) {
-  const rows: Array<Array<{text: string; callback_data: string}>> = order.map((id, i) => [{ text: (i === 0 ? "✅ " : "") + (i + 1) + ". " + (MODEL_CATALOG.find(m => m.id === id)?.name || id), callback_data: "model:" + i }]);
+  const rows: Array<Array<{text: string; callback_data: string}>> = order.map((id, i) => [{ text: (i === 0 ? "✅ " : "") + (i + 1) + ". " + ((await getFreeModelCatalog(env)).find(m => m.id === id)?.name || id), callback_data: "model:" + i }]);
   rows.push([{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]);
   return { inline_keyboard: rows };
 }
@@ -1447,7 +1494,7 @@ async function getModelOrder(env: Env): Promise<string[]> {
   try {
     const parsed = JSON.parse(await stateGet(env, "config:model_order") || "[]");
     if (Array.isArray(parsed)) {
-      const valid = parsed.filter((x: unknown) => typeof x === "string" && MODEL_CATALOG.some(m => m.id === x));
+      const valid = parsed.filter((x: unknown) => typeof x === "string" && (await getFreeModelCatalog(env)).some(m => m.id === x));
       if (valid.length) return [...new Set([...valid, ...MODEL_CATALOG.map(m => m.id)])];
     }
   } catch {}
