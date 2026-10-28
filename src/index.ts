@@ -612,12 +612,11 @@ function safeDate(value: string): string {
   return Number.isNaN(d.getTime()) ? "" : d.toISOString();
 }
 
+// Emergency fallback only: the live OpenRouter catalog is authoritative when reachable.
+// Do not pin retired :free IDs here; that makes a removed model look available forever.
 const MODEL_CATALOG = [
   { id: "google/gemma-4-31b-it:free", name: "Gemma 4 31B", role: "مدل رایگان عمومی" },
-  { id: "nvidia/nemotron-3.5-lightning:free", name: "Nemotron 3.5 Lightning", role: "مدل رایگان سریع" },
-  { id: "nvidia/nemotron-3.5-super-vl:free", name: "Nemotron 3.5 Super VL", role: "مدل رایگان چندمنظوره" },
-  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", name: "Nemotron 3 Nano Omni", role: "مدل رایگان چندمنظوره" },
-  { id: "minimax/minimax-m3.1-flash:free", name: "MiniMax M3.1 Flash", role: "مدل رایگان سریع" },
+  { id: "google/gemma-4-26b-a4b-it:free", name: "Gemma 4 26B A4B", role: "مدل رایگان عمومی" },
   { id: "xingchen-agi/xing4.0-29b-a4b:free", name: "Xing4.0 29B", role: "مدل رایگان عمومی" },
   { id: "thinkingmachines/inkling:free", name: "Inkling", role: "مدل رایگان عمومی" },
   { id: "thinkingmachines/inkling-small:free", name: "Inkling Small", role: "مدل رایگان سبک" },
@@ -631,35 +630,59 @@ const MODEL_CATALOG = [
 
 async function getFreeModelCatalog(env: Env): Promise<Array<{id:string;name:string;role:string}>> {
   const cacheKey = "cache:openrouter-free-models";
+  const isUsable = (id: string) =>
+    id.endsWith(":free") &&
+    !id.startsWith("nvidia/") &&
+    id !== "minimax/minimax-m3.1-flash:free" &&
+    id !== "nvidia/nemotron-3-ultra-550b-a55b:free";
+
   try {
     const cached = await stateGet(env, cacheKey);
     if (cached) {
       const parsed = JSON.parse(cached);
-      if (Array.isArray(parsed) && parsed.length) return parsed.filter((m: any) => !String(m?.id || "").startsWith("nvidia/nemotron-3-ultra-550b-a55b"));
+      if (Array.isArray(parsed)) {
+        const filtered = parsed.filter((m: any) => isUsable(String(m?.id || "")));
+        if (filtered.length) return filtered;
+      }
     }
   } catch {}
-  const byId = new Map<string, {id:string;name:string;role:string}>(MODEL_CATALOG.map(m => [m.id, m]));
+
+  // Use the live catalog as the source of truth. Only use the small fallback list
+  // when the catalog endpoint itself is unavailable, not when a model was retired.
   try {
-    const response = await fetch("https://openrouter.ai/api/v1/models", { headers: { accept: "application/json" }, signal: AbortSignal.timeout(2500) });
+    const response = await fetch("https://openrouter.ai/api/v1/models", {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(5000)
+    });
     if (response.ok) {
       const data: any = await response.json();
+      const live = new Map<string, {id:string;name:string;role:string}>();
       for (const model of Array.isArray(data?.data) ? data.data : []) {
         const id = String(model?.id || "");
         const pricing = model?.pricing || {};
         const modalities = model?.architecture?.output_modalities;
-        const isFreeTextModel = id.endsWith(":free") && !id.startsWith("nvidia/nemotron-3-ultra-550b-a55b") &&
-          Number(pricing.prompt) === 0 && Number(pricing.completion) === 0 &&
+        const isFreeTextModel = isUsable(id) &&
+          Number(pricing.prompt) === 0 &&
+          Number(pricing.completion) === 0 &&
           (!Array.isArray(modalities) || modalities.includes("text"));
         if (!isFreeTextModel) continue;
-        byId.set(id, { id, name: String(model?.name || id).slice(0,100), role: "مدل رایگان OpenRouter" });
+        live.set(id, { id, name: String(model?.name || id).slice(0,100), role: "مدل رایگان OpenRouter" });
       }
+      if (live.size) {
+        const catalog = [...live.values()];
+        try { await statePut(env, cacheKey, JSON.stringify(catalog), 60 * 60 * 3); } catch {}
+        return catalog;
+      }
+    } else {
+      console.warn("free_model_catalog_http_error", response.status);
     }
   } catch (error) {
     console.warn("free_model_catalog_fetch_failed", error instanceof Error ? error.message : String(error));
   }
-  const catalog = [...byId.values()];
-  try { await statePut(env, cacheKey, JSON.stringify(catalog), 60 * 60 * 12); } catch {}
-  return catalog;
+
+  const fallback = MODEL_CATALOG.filter(m => isUsable(m.id));
+  try { await statePut(env, cacheKey, JSON.stringify(fallback), 60 * 15); } catch {}
+  return fallback;
 }
 
 async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost[]> {
@@ -684,7 +707,7 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
     JSON.stringify(payload)
   ].join("\n");
   const errors: string[] = [];
-  for (const model of models.slice(0, 3)) {
+  for (const model of models.filter(id => !id.startsWith("nvidia/") && id !== "minimax/minimax-m3.1-flash:free").slice(0, 3)) {
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
@@ -1520,10 +1543,30 @@ async function getModelOrder(env: Env): Promise<string[]> {
 
 async function callOpenRouterTest(key: string, model: string): Promise<{ok: boolean; error?: string}> {
   try {
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "authorization": `Bearer ${key}` }, body: JSON.stringify({ model, messages: [{ role: "user", content: "Reply with exactly: OK" }], max_tokens: 10, temperature: 0 }), signal: AbortSignal.timeout(30000) });
-    if (!response.ok) return { ok: false, error: `HTTP ${response.status}: ${(await response.text()).slice(0, 180)}` };
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: { "content-type": "application/json", "authorization": `Bearer ${key}` },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: "user", content: "Reply with exactly: OK" }],
+        // Some reasoning models need more than 10 tokens before emitting visible text.
+        max_tokens: 64,
+        temperature: 0
+      }),
+      signal: AbortSignal.timeout(30000)
+    });
+    if (!response.ok) return { ok: false, error: `HTTP ${response.status}: ${(await response.text()).slice(0, 220)}` };
     const data: any = await response.json();
-    return data?.choices?.[0]?.message?.content ? { ok: true } : { ok: false, error: "پاسخ خالی از مدل" };
+    const message = data?.choices?.[0]?.message;
+    const content = typeof message?.content === "string"
+      ? message.content.trim()
+      : Array.isArray(message?.content)
+        ? message.content.map((part: any) => typeof part?.text === "string" ? part.text : "").join("").trim()
+        : "";
+    if (content) return { ok: true };
+    const finishReason = String(data?.choices?.[0]?.finish_reason || "unknown");
+    const detail = message?.refusal ? "model_refusal" : message?.reasoning ? "reasoning_only_no_visible_text" : "empty_content";
+    return { ok: false, error: `پاسخ متنی خالی از مدل (${detail}; finish_reason=${finishReason})` };
   } catch (e) { return { ok: false, error: e instanceof Error ? e.message.slice(0, 180) : "خطای اتصال" }; }
 }
 

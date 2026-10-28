@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.15.0 — 2026-10-28
+- Stop advertising retired MiniMax M3.1 Flash `:free`; when OpenRouter's live catalog is available, use it as authoritative instead of permanently merging stale fallback IDs.
+- Exclude NVIDIA-hosted models from the free-model catalog and curation attempts after repeated empty-output failures in connection tests; the explicitly excluded Nemotron 3 Ultra remains excluded.
+- Filter cached and fallback catalogs against known unusable IDs, shorten fallback cache lifetime, and expand live catalog timeout to reduce stale-model persistence.
+- Improve connection tests for reasoning models by increasing test output budget and parsing both string and text-block message content; report more specific diagnostics for empty responses.
+- Keep all model selection restricted to free `:free` endpoints; no paid fallback added.
+
 ## 1.14.0 — 2026-10-28
 - Restore the missing five-minute Cron handler: each scheduled event now awaits the RSS → AI curation → publication pipeline and logs start, result, and unhandled failure.
 - Bound scheduled AI curation to three free-model attempts with a 25-second per-model timeout, avoiding long sequential stalls.
