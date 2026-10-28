@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.13.2 — 2026-10-28
+- Fix manual web search appearing to hang: try at most two free models with a 10-second per-model timeout instead of serially trying the entire free catalog for up to 90 seconds per model.
+- Shorten free-model catalog discovery timeout to 2.5 seconds so webhook background work is less likely to be terminated before a reply is sent.
+- Limit each manual search to three candidate stories to keep Telegram responses within the Worker background execution window; surface a clear failure message when both attempts fail.
+
+
 ## 1.13.1 — 2026-10-28
 - Explicitly exclude NVIDIA Nemotron 3 Ultra from both discovered and fallback model lists, as requested.
 - Remove the free router that could randomly select the excluded model; use explicit `:free` endpoints only.
