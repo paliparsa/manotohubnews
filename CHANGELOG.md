@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.8.0 — 2026-10-28
+- Add persistent custom editorial topics with add/edit/delete controls in Telegram; deleting a custom topic removes it from active editorial filters without touching sources or published posts.
+- Add manual AI-assisted topic search using Google News RSS in Persian and English, source-grounded summaries, and per-story approve/publish or reject buttons. Manual search never publishes without explicit approval.
+- Keep default topics, source management, scheduled pipeline, and existing publication controls intact.
+
+
 ## 1.7.1 — 2026-10-28
 - Check the active filter-revision seen keys before applying early filters, avoiding repeated writes and inflated rejection counts for already evaluated items.
 
