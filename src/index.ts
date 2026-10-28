@@ -605,22 +605,7 @@ function safeDate(value: string): string {
 }
 
 const MODEL_CATALOG = [
-  { id: "openrouter/free", name: "OpenRouter Free Router", role: "مسیریاب پویای مدل‌های رایگان" },
-  { id: "google/gemma-4-31b-it:free", name: "Gemma 4 31B", role: "مدل رایگان عمومی" },
-  { id: "nvidia/nemotron-3.5-lightning:free", name: "Nemotron 3.5 Lightning", role: "مدل رایگان سریع" },
-  { id: "nvidia/nemotron-3.5-super-vl:free", name: "Nemotron 3.5 Super VL", role: "مدل رایگان چندمنظوره" },
-  { id: "nvidia/nemotron-3-ultra-550b-a55b:free", name: "Nemotron 3 Ultra (free)", role: "مدل رایگان استدلالی" },
-  { id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free", name: "Nemotron 3 Nano Omni", role: "مدل رایگان چندمنظوره" },
-  { id: "minimax/minimax-m3.1-flash:free", name: "MiniMax M3.1 Flash", role: "مدل رایگان سریع" },
-  { id: "xingchen-agi/xing4.0-29b-a4b:free", name: "Xing4.0 29B", role: "مدل رایگان عمومی" },
-  { id: "thinkingmachines/inkling:free", name: "Inkling", role: "مدل رایگان عمومی" },
-  { id: "thinkingmachines/inkling-small:free", name: "Inkling Small", role: "مدل رایگان سبک" },
-  { id: "dots-studio/dots-3-note-preview:free", name: "Dots 3 Note", role: "مدل رایگان عمومی" },
-  { id: "recursive/flint-v1.0:free", name: "Flint v1.0", role: "مدل رایگان عمومی" },
-  { id: "liquid/lfm-2.5-2.6b:free", name: "Liquid LFM 2.5", role: "مدل رایگان سبک" },
-  { id: "cohere/north-mini-code:free", name: "Cohere North Mini Code", role: "مدل رایگان" },
-  { id: "poolside/laguna-s-2.1:free", name: "Laguna S 2.1", role: "مدل رایگان آزمایشی" },
-  { id: "poolside/laguna-xs-2.1:free", name: "Laguna XS 2.1", role: "مدل رایگان سبک" }
+  { id: "openrouter/free", name: "OpenRouter Free Router", role: "مسیریاب پویای مدل‌های رایگان" }
 ];
 
 async function getFreeModelCatalog(env: Env): Promise<Array<{id:string;name:string;role:string}>> {
@@ -1370,7 +1355,7 @@ async function handleAdminCallback(env: Env, query: any) {
   if (data === "menu:setkey") { await statePut(env, "telegram:awaiting_openrouter_key:" + fromId, "1", 600); await telegramReply(env, chatId, "🔐 <b>ثبت یا تغییر کلید OpenRouter</b>\n\nکلید را در پیام بعدی بفرست. پیام کلید پس از دریافت، تا حد امکان حذف می‌شود و مقدار آن رمزگذاری خواهد شد.", mainMenuKeyboard()); return; }
   if (data === "menu:delkey") { await telegramReply(env, chatId, "<b>حذف کلید OpenRouter؟</b>\nبا تأیید، کلید ذخیره‌شده پاک می‌شود.", { inline_keyboard: [[{ text: "🗑 بله، حذف شود", callback_data: "confirm:delkey" }], [{ text: "لغو", callback_data: "menu:home" }]] }); return; }
   if (data === "confirm:delkey") { await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "config:openrouter_key" }); await telegramReply(env, chatId, "🗑 کلید OpenRouter حذف شد.", mainMenuKeyboard()); return; }
-  if (data === "menu:test") { const key = await getOpenRouterKey(env); if (!key) { await telegramReply(env, chatId, "اول از دکمهٔ «ثبت / تغییر کلید» استفاده کن.", mainMenuKeyboard()); return; } const model = (await getModelOrder(env))[0] || MODEL_CATALOG[0].id; await telegramReply(env, chatId, "⏳ در حال آزمایش اتصال به مدل اصلی…"); const result = await callOpenRouterTest(key, model); await telegramReply(env, chatId, result.ok ? "✅ اتصال موفق است\nمدل پاسخ‌دهنده: <code>" + escapeHtml(model) + "</code>" : "❌ اتصال ناموفق بود\nمدل: <code>" + escapeHtml(model) + "</code>\nخطا: " + escapeHtml(result.error || "خطای نامشخص"), mainMenuKeyboard()); return; }
+  if (data === "menu:test") { const key = await getOpenRouterKey(env); if (!key) { await telegramReply(env, chatId, "اول از دکمهٔ «ثبت / تغییر کلید» استفاده کن.", mainMenuKeyboard()); return; } const model = (await getModelOrder(env))[0] || "openrouter/free"; await telegramReply(env, chatId, "⏳ در حال آزمایش اتصال به مدل اصلی…"); const result = await callOpenRouterTest(key, model); await telegramReply(env, chatId, result.ok ? "✅ اتصال موفق است\nمدل پاسخ‌دهنده: <code>" + escapeHtml(model) + "</code>" : "❌ اتصال ناموفق بود\nمدل: <code>" + escapeHtml(model) + "</code>\nخطا: " + escapeHtml(result.error || "خطای نامشخص"), mainMenuKeyboard()); return; }
   await telegramReply(env, chatId, "گزینه ناشناخته است. از منوی اصلی استفاده کن.", mainMenuKeyboard());
 }
 
@@ -1491,14 +1476,15 @@ async function runDryRun(env: Env, chatId: number | string): Promise<void> {
 }
 
 async function getModelOrder(env: Env): Promise<string[]> {
+  const catalog = await getFreeModelCatalog(env);
   try {
     const parsed = JSON.parse(await stateGet(env, "config:model_order") || "[]");
     if (Array.isArray(parsed)) {
-      const valid = parsed.filter((x: unknown) => typeof x === "string" && (await getFreeModelCatalog(env)).some(m => m.id === x));
-      if (valid.length) return [...new Set([...valid, ...MODEL_CATALOG.map(m => m.id)])];
+      const valid = parsed.filter((x: unknown) => typeof x === "string" && catalog.some(m => m.id === x));
+      if (valid.length) return [...new Set([...valid, ...catalog.map(m => m.id)])];
     }
   } catch {}
-  return MODEL_CATALOG.map(m => m.id);
+  return catalog.map(m => m.id);
 }
 
 async function callOpenRouterTest(key: string, model: string): Promise<{ok: boolean; error?: string}> {
