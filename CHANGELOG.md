@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.20.0 — 2026-10-28
+- Add an admin-only manual run button independent of the five-minute Cron trigger, with immediate start feedback and a final run summary.
+- Persist live pipeline snapshots at run start, after feed ingestion, and after AI curation so diagnostics can show progress instead of only the previous completed run.
+- Make manual topic search query Google News RSS and Bing News RSS directly rather than filtering only items already present in the scheduled-feed cache.
+- Surface per-provider RSS search errors and distinguish feed failures from AI returning no source-grounded stories.
+- Update admin copy to accurately describe RSS-based topic search and preserve explicit approval before publication.
+
 ## 1.19.2 — 2026-10-28
 - Add an explicit Worker build version and expose it in `/health` and the Telegram health report so stale Cloudflare deployments are immediately identifiable.
 - Include configured AI provider/key-presence flags, last successful model, and the last run status/error in `/health` without exposing credentials.
