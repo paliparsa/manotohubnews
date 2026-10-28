@@ -200,8 +200,9 @@ async function runPipeline(env: Env, trigger: string) {
     const handled = new Set<string>();
     for (const post of aiPosts) {
       const supporting = candidates.filter(x => post.supportingIds.includes(x.id));
-      const topicId = EDITORIAL_TOPICS.some(t => t.id === post.topic) ? String(post.topic) : topicFromText(post.category + " " + post.headline + " " + post.summary);
-      if (!settings.topics.includes(topicId)) {
+      const allTopics = await getEditorialTopics(env);
+      const topicId = allTopics.some(t => t.id === post.topic) ? String(post.topic) : topicFromText(post.category + " " + post.headline + " " + post.summary, allTopics);
+      if (topicId === "other" || !settings.topics.includes(topicId)) {
         for (const item of supporting) { await recordRejected(env, item, "topic_disabled", "حوزه غیرفعال: " + topicId, revision); await markSeen(env, item, revision); handled.add(item.id); countReason("حوزه غیرفعال"); }
         continue;
       }
@@ -344,7 +345,7 @@ export class NewsState {
 }
 
 
-type EditorialTopic = { id: string; label: string; hints: string[] };
+type EditorialTopic = { id: string; label: string; hints: string[]; custom?: boolean };
 const EDITORIAL_TOPICS: EditorialTopic[] = [
   { id: "iran", label: "ایران", hints: ["iran", "iranian", "tehran", "ایران", "تهران", "ایرانی"] },
   { id: "world", label: "جهان و دیپلماسی", hints: ["world", "global", "international", "diplomacy", "foreign policy", "جهان", "بین‌الملل", "دیپلماسی", "سیاست خارجی"] },
@@ -355,6 +356,22 @@ const EDITORIAL_TOPICS: EditorialTopic[] = [
   { id: "turkey", label: "ترکیه", hints: ["turkey", "turkish", "ankara", "istanbul", "ترکیه", "آنکارا", "استانبول"] }
 ];
 type EditorialSettings = { topics: string[]; allowKeywords: string[]; blockKeywords: string[]; sensitivity: "broad" | "balanced" | "strict"; maxAgeHours: number };
+async function getEditorialTopics(env: Env): Promise<EditorialTopic[]> {
+  const raw = await stateGet(env, "config:custom_topics");
+  let custom: EditorialTopic[] = [];
+  try {
+    const parsed = JSON.parse(raw || "[]");
+    if (Array.isArray(parsed)) custom = parsed.filter((x: any) =>
+      x && typeof x.id === "string" && /^custom_[a-f0-9]{1,12}$/.test(x.id) &&
+      typeof x.label === "string" && Array.isArray(x.hints) &&
+      x.hints.every((h: unknown) => typeof h === "string")
+    ).slice(0, 40).map((x: any) => ({ id: x.id, label: String(x.label).slice(0, 60), hints: x.hints.map(String).slice(0, 20), custom: true }));
+  } catch {}
+  return [...EDITORIAL_TOPICS, ...custom];
+}
+async function saveCustomTopics(env: Env, topics: EditorialTopic[]): Promise<void> {
+  await statePutPermanent(env, "config:custom_topics", JSON.stringify(topics.filter(t => t.custom).slice(0, 40).map(t => ({ id: t.id, label: t.label, hints: t.hints }))));
+}
 function normalizeFilterText(value: string): string {
   return value.toLocaleLowerCase("fa-IR").normalize("NFKC").replace(/[يى]/g, "ی").replace(/ك/g, "ک").replace(/[\u064B-\u065F\u0670]/g, " ").replace(/\s+/g, " ").trim();
 }
@@ -370,10 +387,11 @@ async function getEditorialSettings(env: Env): Promise<EditorialSettings> {
     stateGet(env, "config:editorial_sensitivity"),
     stateGet(env, "config:max_age_hours")
   ]);
+  const allTopics = await getEditorialTopics(env);
   let topics = ["iran", "world", "war", "tech", "internet", "economy"];
   try {
     const parsed = JSON.parse(topicsRaw || "null");
-    if (Array.isArray(parsed)) topics = [...new Set(parsed.filter((x: unknown) => typeof x === "string" && EDITORIAL_TOPICS.some(t => t.id === x)))];
+    if (Array.isArray(parsed)) topics = [...new Set(parsed.filter((x: unknown) => typeof x === "string" && allTopics.some(t => t.id === x)))];
   } catch {}
   const sensitivity = sensitivityRaw === "broad" || sensitivityRaw === "strict" ? sensitivityRaw : "balanced";
   const parsedAge = Number(ageRaw);
@@ -388,11 +406,11 @@ async function bumpFilterRevision(env: Env): Promise<void> {
 async function getFilterRevision(env: Env): Promise<string> {
   return (await stateGet(env, "config:filter_revision")) || "1";
 }
-function topicFromText(value: string): string {
+function topicFromText(value: string, topics: EditorialTopic[] = EDITORIAL_TOPICS): string {
   const text = " " + normalizeFilterText(value) + " ";
-  const scores = EDITORIAL_TOPICS.map(topic => ({ id: topic.id, score: topic.hints.reduce((n, hint) => n + (text.includes(normalizeFilterText(hint)) ? 1 : 0), 0) }));
+  const scores = topics.map(topic => ({ id: topic.id, score: topic.hints.reduce((n, hint) => n + (text.includes(normalizeFilterText(hint)) ? 1 : 0), 0) }));
   scores.sort((a, b) => b.score - a.score);
-  return scores[0]?.score ? scores[0].id : "iran";
+  return scores[0]?.score ? scores[0].id : "other";
 }
 function confidenceThreshold(sensitivity: EditorialSettings["sensitivity"]): number {
   return sensitivity === "broad" ? 0.62 : sensitivity === "strict" ? 0.88 : 0.78;
@@ -406,17 +424,20 @@ async function recordRejected(env: Env, item: NewsItem, reason: string, detail: 
 }
 async function editorialMenu(env: Env, chatId: number | string): Promise<void> {
   const s = await getEditorialSettings(env);
-  const topicRows: Array<Array<{text: string; callback_data: string}>> = EDITORIAL_TOPICS.map(topic => [{
+  const allTopics = await getEditorialTopics(env);
+  const topicRows: Array<Array<{text: string; callback_data: string}>> = allTopics.map(topic => [{
     text: (s.topics.includes(topic.id) ? "✅ " : "▫️ ") + topic.label,
     callback_data: "editorial:topic:" + topic.id
   }]);
+  topicRows.push([{ text: "➕ افزودن حوزه", callback_data: "topics:add" }, { text: "🛠 مدیریت / حذف حوزه", callback_data: "topics:manage" }]);
+  topicRows.push([{ text: "🔎 جست‌وجوی موضوعی با AI", callback_data: "topicsearch:start" }]);
   topicRows.push([{ text: "✏️ کلمات مجاز / اولویت‌دار", callback_data: "editorial:allow" }, { text: "🚫 کلمات ممنوع", callback_data: "editorial:block" }]);
   topicRows.push([{ text: "🎚 حساسیت: " + (s.sensitivity === "broad" ? "گسترده" : s.sensitivity === "strict" ? "سخت‌گیرانه" : "متعادل"), callback_data: "editorial:sensitivity" }]);
   topicRows.push([{ text: "🕒 بازه خبر: " + (s.maxAgeHours === 0 ? "بدون محدودیت" : s.maxAgeHours + " ساعت"), callback_data: "editorial:age" }]);
   topicRows.push([{ text: "📊 گزارش اجرا و فیلترها", callback_data: "menu:diagnostics" }, { text: "⬅️ منوی اصلی", callback_data: "menu:home" }]);
   const allowText = s.allowKeywords.length ? s.allowKeywords.join("، ") : "تنظیم نشده";
   const blockText = s.blockKeywords.length ? s.blockKeywords.join("، ") : "تنظیم نشده";
-  const enabledTopics = EDITORIAL_TOPICS.filter(t => s.topics.includes(t.id)).map(t => t.label).join("، ") || "هیچ‌کدام";
+  const enabledTopics = allTopics.filter(t => s.topics.includes(t.id)).map(t => t.label).join("، ") || "هیچ‌کدام";
   await telegramReply(env, chatId, "<b>🎛 تنظیمات تحریریه</b>\n\n<b>حوزه‌های فعال:</b> " + escapeHtml(enabledTopics) +
     "\n<b>کلمات مجاز/اولویت‌دار:</b> " + escapeHtml(allowText.slice(0, 500)) +
     "\n<b>کلمات ممنوع:</b> " + escapeHtml(blockText.slice(0, 500)) +
@@ -545,7 +566,8 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
   try { const parsed = JSON.parse(orderRaw || "[]"); if (Array.isArray(parsed)) order = parsed.filter((x: unknown) => typeof x === "string" && MODEL_CATALOG.some(m => m.id === x)); } catch {}
   const models = [...new Set([...order, ...MODEL_CATALOG.map(m => m.id)])];
   const editorial = await getEditorialSettings(env);
-  const activeTopics = EDITORIAL_TOPICS.filter(t => editorial.topics.includes(t.id));
+  const allTopics = await getEditorialTopics(env);
+  const activeTopics = allTopics.filter(t => editorial.topics.includes(t.id));
   const prompt = [
     "این فهرست خبرها را به فارسی بررسی و رویدادهای تکراری را ادغام کن. حداکثر 12 رویداد مرتبط برگردان.",
     "موضوعات مجاز فقط این شناسه‌ها هستند: " + activeTopics.map(t => t.id + " (" + t.label + ")").join(", "),
