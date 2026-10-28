@@ -992,7 +992,7 @@ function isPriorityIranNews(value: string): boolean {
   const terms = [
     "iran","iranian","tehran","islamic republic","irgc","iran israel","israel iran",
     "reẓa pahlavi","reza pahlavi","crown prince pahlavi","pahlavi team","national council of iran",
-    "israel","israeli","united states","united states of america","usa","u.s.","us military","american","washington","trump",
+    "israel","israeli","united states","united states of america","usa","u.s.","us ","us-","us:","us military","american","washington","trump",
     "middle east","gulf","saudi arabia","saudi","qatar","lebanon","lebanese","syria","syrian",
     "war","missile","airstrike","attack","ceasefire","nuclear","sanction","negotiation","patriot battery",
     "ایران","ایرانی","تهران","جمهوری اسلامی","سپاه پاسداران","شاهزاده پهلوی","رضا پهلوی",
