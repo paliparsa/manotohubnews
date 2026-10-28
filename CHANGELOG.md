@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.19.1 — 2026-10-28
+- Keep news/admin processing alive if legacy OpenRouter credential cleanup encounters a transient Durable Object error; retry cleanup on the next run.
+- Preserve Cloudflare model IDs as slash-separated path segments when calling the Workers AI run endpoint.
+
+
 ## 1.19.0 — 2026-10-28
 - Remove OpenRouter API integration, stored OpenRouter key flow, and OpenRouter-specific web-search tool from runtime code.
 - Add encrypted, separate credential management for Gemini, Groq, and Cloudflare Workers AI in the Telegram admin panel, including provider-specific deletion and connection tests.
