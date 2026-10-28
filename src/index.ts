@@ -54,7 +54,7 @@ const DEFAULT_FEEDS: Array<{ url: string; language: string }> = [
   { url: "https://news.google.com/rss/search?q=(Iran+OR+Israel+OR+United+States)+when:2d&hl=ru&gl=RU&ceid=RU:ru", language: "ru" }
 ];
 
-const BUILD_VERSION = "1.19.2";
+const BUILD_VERSION = "1.20.0";
 
 const SYSTEM_PROMPT = `تو دبیر خبر یک کانال خبری فارسی‌زبان هستی. موضوعات مجاز را فقط از تنظیمات تحریریه‌ای که در پیام کاربر آمده پیروی کن.
 فقط از داده‌های ورودی استفاده کن؛ هرگز جزئیات، نقل‌قول، آمار، تاریخ یا منبع جدید نساز.
