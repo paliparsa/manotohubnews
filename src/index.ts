@@ -994,8 +994,9 @@ async function addFeedSourceFromMessage(env: Env, chatId: number | string, fromI
 type PublishingMode = "auto" | "approval" | "save_only" | "paused";
 async function getPublicationSettings(env: Env): Promise<{enabled: boolean; mode: PublishingMode}> {
   const [enabledRaw, modeRaw] = await Promise.all([stateGet(env, "config:publishing_enabled"), stateGet(env, "config:publishing_mode")]);
-  const mode: PublishingMode = ["auto","approval","save_only","paused"].includes(modeRaw || "") ? modeRaw as PublishingMode : "auto";
-  return { enabled: enabledRaw !== "false", mode };
+  const legacyEnabled = enabledRaw !== "false";
+  const mode: PublishingMode = !legacyEnabled ? "paused" : (["auto","approval","save_only","paused"].includes(modeRaw || "") ? modeRaw as PublishingMode : "auto");
+  return { enabled: true, mode };
 }
 function publishingKeyboard(settings: {enabled: boolean; mode: PublishingMode}) {
   const modes: Array<{id:PublishingMode;label:string}> = [{id:"auto",label:"🤖 انتشار مستقیم"},{id:"approval",label:"📝 تأیید ادمین"},{id:"save_only",label:"💾 فقط ذخیره خبر"},{id:"paused",label:"⏸ توقف موقت انتشار"}];
