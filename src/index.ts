@@ -689,7 +689,7 @@ async function handleAdminMessage(env: Env, message: any) {
   }
   if (/^\/cancel(?:@\w+)?$/i.test(text)) {
     const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
-    for (const key of ["telegram:awaiting_feed_url:", "telegram:awaiting_openrouter_key:", "telegram:awaiting_allow_keywords:", "telegram:awaiting_block_keywords:"]) await stateCall(stub, { op: "delete", key: key + fromId });
+    for (const key of ["telegram:awaiting_feed_url:", "telegram:awaiting_openrouter_key:", "telegram:awaiting_allow_keywords:", "telegram:awaiting_block_keywords:", "telegram:awaiting_topic_add:", "telegram:awaiting_topic_edit:", "telegram:awaiting_topic_search:", "telegram:topic_edit_id:"]) await stateCall(stub, { op: "delete", key: key + fromId });
     await telegramReply(env, chatId, "لغو شد.", mainMenuKeyboard());
     return;
   }
@@ -705,6 +705,19 @@ async function handleAdminMessage(env: Env, message: any) {
     await stateCall(stub, { op: "delete", key: awaitingBlockKey });
     await bumpFilterRevision(env);
     await telegramReply(env, chatId, "✅ فهرست " + (isAllow ? "کلمات مجاز/اولویت‌دار" : "کلمات ممنوع") + " ذخیره شد. تعداد عبارت‌ها: " + parseKeywordList(value).length, { inline_keyboard: [[{ text: "🎛 بازگشت به تحریریه", callback_data: "menu:editorial" }], [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]] });
+    return;
+  }
+  const awaitingTopicSearchKey = "telegram:awaiting_topic_search:" + fromId;
+  if (!text.startsWith("/") && await stateGet(env, awaitingTopicSearchKey) === "1") {
+    await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: awaitingTopicSearchKey });
+    await searchTopicAndSendCandidates(env, chatId, text);
+    return;
+  }
+  const awaitingTopicAddKey = "telegram:awaiting_topic_add:" + fromId;
+  const awaitingTopicEditKey = "telegram:awaiting_topic_edit:" + fromId;
+  if (!text.startsWith("/") && (await stateGet(env, awaitingTopicAddKey) === "1" || await stateGet(env, awaitingTopicEditKey) === "1")) {
+    const editing = await stateGet(env, awaitingTopicEditKey) === "1";
+    await saveCustomTopicFromMessage(env, chatId, fromId, text, editing);
     return;
   }
   const awaitingFeedKey = "telegram:awaiting_feed_url:" + fromId;
@@ -778,6 +791,7 @@ function mainMenuKeyboard() {
     [{ text: "📊 وضعیت سیستم", callback_data: "menu:status" }, { text: "📣 تنظیم انتشار", callback_data: "menu:publishing" }],
     [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }],
     [{ text: "📈 گزارش اجرا", callback_data: "menu:diagnostics" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
+    [{ text: "🔎 جست‌وجوی خبر با موضوع دلخواه", callback_data: "topicsearch:start" }],
     [{ text: "🔌 آزمایش اتصال", callback_data: "menu:test" }, { text: "🔐 ثبت / تغییر کلید", callback_data: "menu:setkey" }],
     [{ text: "🗑 حذف کلید", callback_data: "menu:delkey" }]
   ] };
