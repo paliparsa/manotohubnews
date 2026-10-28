@@ -241,13 +241,22 @@ async function runPipeline(env: Env, trigger: string) {
         "\n\n🕒 <b>زمان انتشار:</b> " + escapeHtml(publishedAt) + " (تهران)\n@Manotohubir";
       const publication = await getPublicationSettings(env);
       if (publication.enabled && publication.mode === "auto") {
-        await telegramSend(env, message);
-        await statePut(env, "posted:" + postKey, JSON.stringify({ at: startedAt, headline: post.headline, supporting: supporting.map(s => s.url) }), 60 * 60 * 24 * 30);
-        stats.published++;
+        try {
+          await telegramSend(env, message);
+          await statePut(env, "posted:" + postKey, JSON.stringify({ at: startedAt, headline: post.headline, supporting: supporting.map(s => s.url) }), 60 * 60 * 24 * 30);
+          stats.published++;
+        } catch (publishError) {
+          const errorText = publishError instanceof Error ? publishError.message.slice(0,240) : "خطای نامشخص";
+          await statePutPermanent(env, "pending:" + postKey, JSON.stringify({ postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url), status: "publish_error", retryCount: 1, lastError: errorText, lastAttemptAt: startedAt }));
+          stats.queued++; stats.adminNotificationFailed++;
+          console.error("auto_publish_failed", JSON.stringify({postKey,error:errorText}));
+          if (env.ADMIN_TELEGRAM_ID) { try { await telegramReply(env, env.ADMIN_TELEGRAM_ID, "❌ <b>انتشار خودکار ناموفق بود؛ خبر در صف بازیابی ذخیره شد.</b>\n"+escapeHtml(errorText)+"\n\n"+message,{inline_keyboard:[[{text:"🔁 تلاش برای انتشار",callback_data:"publish:"+postKey},{text:"🗑 رد خبر",callback_data:"skip:"+postKey}],[{text:"🧾 صف بازبینی",callback_data:"queue:list"}]]}); } catch (notifyError) { console.error("publish_failure_notification_failed", String(notifyError)); } }
+        }
       } else {
-        await statePutPermanent(env, "pending:" + postKey, JSON.stringify({ postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url) }));
-        if (env.ADMIN_TELEGRAM_ID) {
-          const reason = !publication.enabled ? "انتشار خاموش است؛ پیش‌نویس برای بررسی ذخیره شد." : "منتظر تأیید تو برای انتشار در کانال است.";
+        const pendingRecord = { postKey, message, headline: post.headline, createdAt: startedAt, supporting: supporting.map(s => s.url), status: "pending", retryCount: 0, lastError: null };
+        await statePutPermanent(env, "pending:" + postKey, JSON.stringify(pendingRecord));
+        if (publication.mode !== "save_only" && env.ADMIN_TELEGRAM_ID) {
+          const reason = publication.mode === "paused" || !publication.enabled ? "انتشار موقتاً متوقف است؛ پیش‌نویس برای بررسی ذخیره شد." : "منتظر تأیید تو برای انتشار در کانال است.";
           try {
             await telegramReply(env, env.ADMIN_TELEGRAM_ID, "📝 <b>خبر آمادهٔ انتشار</b>\n" + escapeHtml(reason) + "\n\n" + message, { inline_keyboard: [[{ text: "✅ تأیید و انتشار", callback_data: "publish:" + postKey }, { text: "🗑 رد خبر", callback_data: "skip:" + postKey }]] });
           } catch (error) {
@@ -255,7 +264,7 @@ async function runPipeline(env: Env, trigger: string) {
             console.error("admin_notification_failed", JSON.stringify({ postKey, error: error instanceof Error ? error.message : String(error) }));
             countReason("خطای ارسال پیش‌نویس به ادمین");
           }
-        } else {
+        } else if (publication.mode !== "save_only") {
           stats.adminNotificationFailed++;
           console.error("admin_notification_failed", "ADMIN_TELEGRAM_ID is not configured");
           countReason("شناسه ادمین تنظیم نشده");
