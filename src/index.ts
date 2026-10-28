@@ -188,6 +188,7 @@ async function runPipeline(env: Env, trigger: string) {
     aiPosts: 0, published: 0, queued: 0, adminNotificationFailed: 0,
     rejectionReasons: {}, feedErrors: [], filterRevision: await getFilterRevision(env)
   };
+  await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
   const countReason = (reason: string) => { stats.rejectionReasons[reason] = Number(stats.rejectionReasons[reason] || 0) + 1; };
   try {
     const settings = await getEditorialSettings(env);
@@ -200,6 +201,7 @@ async function runPipeline(env: Env, trigger: string) {
     stats.feedItemsParsed = fetched.length;
     const feedErrorsRaw = await stateGet(env, "status:feed_errors");
     try { stats.feedErrors = JSON.parse(feedErrorsRaw || "[]"); } catch { stats.feedErrors = []; }
+    await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
     const revision = stats.filterRevision;
     const unique = new Map<string, NewsItem>();
     for (const item of fetched) {
@@ -246,6 +248,7 @@ async function runPipeline(env: Env, trigger: string) {
     }
     const aiPosts = await curateWithAI(candidates, env);
     stats.aiPosts = aiPosts.length;
+    await statePut(env, "last_run", JSON.stringify(stats), 60 * 60 * 24 * 14);
     const maxPosts = clampInt(env.MAX_POSTS_PER_RUN, 4, 1, 8);
     const minConfidence = confidenceThreshold(settings.sensitivity);
     const handled = new Set<string>();
@@ -874,6 +877,7 @@ function mainMenuKeyboard() {
     [{ text: "🗂 مدیریت منابع خبر", callback_data: "menu:sources" }, { text: "📡 منابع اجتماعی", callback_data: "social:menu" }],
     [{ text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }],
     [{ text: "📈 گزارش اجرا", callback_data: "menu:diagnostics" }, { text: "🧠 مدل هوش مصنوعی", callback_data: "menu:models" }],
+    [{ text: "▶️ اجرای خبرخوان همین الان", callback_data: "run:manual" }],
     [{ text: "🧾 صف تأیید و بازبینی", callback_data: "queue:list" }, { text: "🧪 تست فیلترها", callback_data: "dryrun:start" }],
     [{ text: "🔎 جست‌وجوی خبر با موضوع دلخواه", callback_data: "topicsearch:start" }],
     [{ text: "🔌 آزمایش اتصال", callback_data: "menu:test" }, { text: "🔐 مدیریت کلیدهای API", callback_data: "menu:keys" }]
@@ -935,14 +939,38 @@ function isPriorityIranNews(value: string): boolean {
 }
 
 async function searchTopicAndSendCandidates(env:Env,chatId:number|string,query:string):Promise<void>{
- const topic=query.trim().slice(0,220);if(topic.length<2||topic.startsWith("/")){await telegramReply(env,chatId,"موضوع خیلی کوتاه یا نامعتبر است؛ دوباره شروع کن.");return;}
- await telegramReply(env,chatId,"🔎 فیدهای خبری فعال را برای این موضوع بررسی می‌کنم؛ فقط لینک‌های واقعی فیدها استفاده می‌شوند و انتشار نیازمند تأیید توست…");
- try{const terms=normalizeFilterText(topic).split(/\s+/).filter(x=>x.length>=3).slice(0,12),fetched=await fetchFeeds(env),candidates=fetched.filter(x=>{const t=normalizeFilterText(x.title+" "+x.snippet);return terms.some(term=>t.includes(term))||(isPriorityIranNews(topic)&&isPriorityIranNews(x.title+" "+x.snippet));}).slice(0,12);
- if(!candidates.length){await telegramReply(env,chatId,"در فیدهای فعال خبر مرتبطی پیدا نشد. منابع RSS/Atom را گسترش بده یا موضوع را دقیق‌تر بنویس.",mainMenuKeyboard());return;}
- const posts=await curateWithAI(candidates,env);let added=0;
- for(const post of posts.filter(x=>x.relevant&&x.headline&&x.summary)){const supporting=candidates.filter(x=>post.supportingIds.includes(x.id)).slice(0,4);if(!supporting.length)continue;const sourceLines=supporting.map(s=>"• <a href=\""+escapeAttr(s.url)+"\">"+escapeHtml(s.source||s.domain)+"</a>").join("\n"),status=supporting.length>1?"📰 <b>چند منبع؛ نیازمند بررسی مستقل</b>":"⚠️ <b>گزارش اولیه؛ یک منبع</b>",message="📰 <b>"+escapeHtml(post.headline)+"</b>\n\n"+escapeHtml(post.summary)+"\n\n"+status+"\n🏷️ <b>موضوع جست‌وجو:</b> "+escapeHtml(topic)+"\n\n<b>منابع:</b>\n"+sourceLines+"\n\n@Manotohubir",id=await hashKey("manual-rss-search|"+normalizeTitle(post.headline)+"|"+supporting.map(x=>normalizeUrl(x.url)).join("|"));if(await stateGet(env,"pending:"+id)||await stateGet(env,"posted:"+id))continue;await statePutPermanent(env,"pending:"+id,JSON.stringify({postKey:id,message,headline:post.headline,createdAt:new Date().toISOString(),supporting:supporting.map(x=>x.url),manualSearch:true}));await telegramReply(env,chatId,message,{inline_keyboard:[[{text:"📣 تأیید و انتشار",callback_data:"publish:"+id},{text:"🗑 رد خبر",callback_data:"skip:"+id}]]});added++;}
- await telegramReply(env,chatId,added?"تمام شد؛ "+added+" خبر از فیدهای فعال برای تأیید آماده شد.":"خروجی قابل‌استناد برای این موضوع پیدا نشد.",mainMenuKeyboard());
- }catch(e){await telegramReply(env,chatId,"❌ جست‌وجوی موضوعی کامل نشد: "+escapeHtml(e instanceof Error?e.message.slice(0,220):"خطای نامشخص"),mainMenuKeyboard());}
+ const topic=query.trim().slice(0,220);
+ if(topic.length<2||topic.startsWith("/")){await telegramReply(env,chatId,"موضوع خیلی کوتاه یا نامعتبر است؛ دوباره شروع کن.");return;}
+ await telegramReply(env,chatId,"🔎 <b>جست‌وجوی مستقل شروع شد.</b>\n\nموضوع را مستقیم در Google News RSS و Bing News RSS جست‌وجو می‌کنم؛ به خبرهای جمع‌آوری‌شده در کرون وابسته نیست.");
+ try{
+  const result=await fetchTopicSearchItems(topic); const candidates=result.items;
+  if(!candidates.length){const errorText=result.errors.length?"\n\nخطاهای جست‌وجو:\n"+escapeHtml(result.errors.slice(0,4).join("\n").slice(0,1000)):"";await telegramReply(env,chatId,"⚠️ از موتورهای RSS نتیجه‌ای قابل‌خواندن دریافت نشد. احتمالاً دسترسی یا پاسخ فیدها مشکل دارد."+errorText,{inline_keyboard:[[{text:"▶️ اجرای خبرخوان",callback_data:"run:manual"},{text:"📊 گزارش اجرا",callback_data:"menu:diagnostics"}],[{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]]});return;}
+  const posts=await curateWithAI(candidates,env);let added=0;
+  for(const post of posts.filter(x=>x.relevant&&x.headline&&x.summary)){
+   const supporting=candidates.filter(x=>post.supportingIds.includes(x.id)).slice(0,4);if(!supporting.length)continue;
+   const sourceLines=supporting.map(s=>'• <a href="'+escapeAttr(s.url)+'">'+escapeHtml(s.source||s.domain)+'</a>').join("\n");
+   const status=supporting.length>1?"📰 <b>چند منبع؛ نیازمند بررسی مستقل</b>":"⚠️ <b>گزارش اولیه؛ یک منبع</b>";
+   const message="📰 <b>"+escapeHtml(post.headline)+"</b>\n\n"+escapeHtml(post.summary)+"\n\n"+status+"\n🏷️ <b>موضوع جست‌وجو:</b> "+escapeHtml(topic)+"\n\n<b>منابع:</b>\n"+sourceLines+"\n\n@Manotohubir";
+   const id=await hashKey("manual-rss-search|"+normalizeTitle(post.headline)+"|"+supporting.map(x=>normalizeUrl(x.url)).join("|"));
+   if(await stateGet(env,"pending:"+id)||await stateGet(env,"posted:"+id))continue;
+   await statePutPermanent(env,"pending:"+id,JSON.stringify({postKey:id,message,headline:post.headline,createdAt:new Date().toISOString(),supporting:supporting.map(x=>x.url),manualSearch:true}));
+   await telegramReply(env,chatId,message,{inline_keyboard:[[{text:"📣 تأیید و انتشار",callback_data:"publish:"+id},{text:"🗑 رد خبر",callback_data:"skip:"+id}]]});added++;
+  }
+  await telegramReply(env,chatId,added?"تمام شد؛ "+added+" خبر از جست‌وجوی مستقیم برای تأیید آماده شد.":"RSS خبر پیدا کرد، اما AI خروجی قابل‌استناد با لینک منبع معتبر نداد. تعداد ورودی‌ها: "+candidates.length+".",{inline_keyboard:[[{text:"📊 گزارش اجرا",callback_data:"menu:diagnostics"}],[{text:"🔎 جست‌وجوی دوباره",callback_data:"topicsearch:start"}],[{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]]});
+ }catch(e){await telegramReply(env,chatId,"❌ جست‌وجوی موضوعی کامل نشد: "+escapeHtml(e instanceof Error?e.message.slice(0,500):"خطای نامشخص"),{inline_keyboard:[[{text:"📊 گزارش اجرا",callback_data:"menu:diagnostics"}],[{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]]});}
+}
+async function fetchTopicSearchItems(topic:string):Promise<{items:NewsItem[];errors:string[]}>{
+ const query=topic.trim().slice(0,220);
+ const feeds=[{url:"https://news.google.com/rss/search?q="+encodeURIComponent(query)+"&when:7d&hl=fa&gl=IR&ceid=IR:fa",language:"fa"},{url:"https://www.bing.com/news/search?q="+encodeURIComponent(query)+"&format=rss",language:"en"}];
+ const results=await Promise.allSettled(feeds.map(async feed=>{
+  const response=await fetch(feed.url,{headers:{"user-agent":"Mozilla/5.0 (compatible; ManotohubirNewsBot/1.20; +https://manotohubir-news.workers.dev)","accept":"application/rss+xml, application/atom+xml, application/xml, text/xml, */*"},signal:AbortSignal.timeout(10000),redirect:"follow"});
+  if(!response.ok)throw new Error(new URL(feed.url).hostname+" HTTP "+response.status);
+  const xml=await response.text();const items=parseFeed(xml,feed.language);if(!items.length)throw new Error(new URL(feed.url).hostname+" returned no parseable entries");return items;
+ }));
+ const items:NewsItem[]=[];const errors:string[]=[];
+ results.forEach((r,i)=>{if(r.status==="fulfilled")items.push(...r.value);else errors.push(new URL(feeds[i].url).hostname+": "+(r.reason instanceof Error?r.reason.message:String(r.reason)).slice(0,180));});
+ const unique=new Map<string,NewsItem>();for(const item of items){const key=normalizeUrl(item.url);if(!unique.has(key))unique.set(key,item);}
+ return {items:[...unique.values()].sort((a,b)=>Date.parse(b.publishedAt||"1970-01-01")-Date.parse(a.publishedAt||"1970-01-01")).slice(0,20),errors};
 }
 function parsedUrlHost(value: string): string {
   try { return new URL(value).hostname.replace(/^www\./, ""); } catch { return "منبع وب"; }
@@ -1177,6 +1205,30 @@ async function handleAdminCallback(env: Env, query: any) {
   if (!query.id || !chatId) return;
   if (!env.ADMIN_TELEGRAM_ID || fromId !== env.ADMIN_TELEGRAM_ID || query.message?.chat?.type !== "private") { await telegramAnswerCallback(env, query.id, "دسترسی ادمین ندارید"); return; }
   await telegramAnswerCallback(env, query.id);
+  if (data === "run:manual") {
+    await telegramReply(env, chatId, "▶️ <b>اجرای دستی شروع شد.</b>\n\nدریافت RSS/Atom → فیلتر خبرها → پردازش AI → صف تأیید/انتشار. این اجرا مستقل از کرون پنج‌دقیقه‌ای است.");
+    const result = await runPipeline(env, "manual");
+    if ((result as any).skipped) {
+      await telegramReply(env, chatId, "⏳ اجرای دیگری در حال انجام است؛ برای جلوگیری از هم‌پوشانی، اجرای دستی جدید شروع نشد.", { inline_keyboard: [[{ text: "📊 دیدن وضعیت زنده", callback_data: "menu:diagnostics" }], [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]] });
+      return;
+    }
+    const raw = await stateGet(env, "last_run");
+    let run: any = null; try { run = raw ? JSON.parse(raw) : null; } catch {}
+    const report = run
+      ? "✅ <b>اجرای دستی تمام شد</b>\nوضعیت: " + escapeHtml(String(run.status || "نامشخص")) +
+        "\nخبرهای دریافت‌شده: " + Number(run.fetched || 0) +
+        "\nکاندیدای یکتا: " + Number(run.uniqueCandidates || 0) +
+        "\nارسال‌شده به AI: " + Number(run.examined || 0) +
+        "\nخروجی AI: " + Number(run.aiPosts || 0) +
+        "\nمنتظر تأیید: " + Number(run.queued || 0) +
+        "\nمنتشرشده: " + Number(run.published || 0) +
+        (run.error ? "\nخطا: " + escapeHtml(String(run.error).slice(0, 600)) : "") +
+        (run.noCandidateReason ? "\nدلیل نبود خبر قابل پردازش: " + escapeHtml(String(run.noCandidateReason)) : "") +
+        "\nخطاهای RSS: " + Number((run.feedErrors || []).length)
+      : "اجرای دستی تمام شد، اما گزارش نهایی پیدا نشد.";
+    await telegramReply(env, chatId, report, { inline_keyboard: [[{ text: "📊 جزئیات و خطاهای اجرا", callback_data: "menu:diagnostics" }], [{ text: "🔁 اجرای دوباره", callback_data: "run:manual" }], [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]] });
+    return;
+  }
   if (data === "menu:sources") { await sendSourcesMenu(env, chatId); return; }
   if (data === "social:menu") { await sendSocialSourcesMenu(env, chatId); return; }
   if (data === "social:add") {
@@ -1269,7 +1321,7 @@ async function handleAdminCallback(env: Env, query: any) {
   }
   if (data === "topicsearch:start") {
     await statePut(env, "telegram:awaiting_topic_search:" + fromId, "1", 600);
-    await telegramReply(env, chatId, "🌐 <b>جست‌وجوی وب با هوش مصنوعی</b>\n\nموضوع یا سؤال خبری‌ات را بفرست؛ مثلاً: <i>آخرین تحولات هوش مصنوعی در اپل</i> یا <i>وضعیت مذاکرات ایران و آمریکا</i>.\n\nمدل با ابزار جست‌وجوی وب، چند جست‌وجو انجام می‌دهد و از منابع آنلاین مختلف خبرها را پیدا و خلاصه می‌کند؛ این بخش به Google News RSS محدود نیست. لینک منابع کنار هر خبر می‌آید. انتشار در کانال فقط با زدن دکمهٔ تأیید انجام می‌شود.\n\nتوجه: جست‌وجو کل اینترنت را تضمینی پوشش نمی‌دهد و ممکن است بعضی سایت‌ها در نتایج ظاهر نشوند. برای لغو /cancel را بفرست.");
+    await telegramReply(env, chatId, "🌐 <b>جست‌وجوی وب با هوش مصنوعی</b>\n\nموضوع یا سؤال خبری‌ات را بفرست؛ مثلاً: <i>آخرین تحولات هوش مصنوعی در اپل</i> یا <i>وضعیت مذاکرات ایران و آمریکا</i>.\n\nموضوع مستقیماً در Google News RSS و Bing News RSS جست‌وجو می‌شود و به کرون یا فیدهای قبلی وابسته نیست. لینک منابع کنار هر خبر می‌آید. انتشار در کانال فقط با زدن دکمهٔ تأیید انجام می‌شود.\n\nتوجه: جست‌وجو کل اینترنت را تضمینی پوشش نمی‌دهد و ممکن است بعضی سایت‌ها در نتایج ظاهر نشوند. برای لغو /cancel را بفرست.");
     return;
   }
   if (data.startsWith("editorial:topic:")) {
