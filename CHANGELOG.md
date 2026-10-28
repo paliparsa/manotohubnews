@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.19.2 — 2026-10-28
+- Add an explicit Worker build version and expose it in `/health` and the Telegram health report so stale Cloudflare deployments are immediately identifiable.
+- Include configured AI provider/key-presence flags, last successful model, and the last run status/error in `/health` without exposing credentials.
+- Show the build version and provider configuration in the Telegram diagnostics report to distinguish stale reports from current Worker behavior.
+
+
 ## 1.19.1 — 2026-10-28
 - Keep news/admin processing alive if legacy OpenRouter credential cleanup encounters a transient Durable Object error; retry cleanup on the next run.
 - Preserve Cloudflare model IDs as slash-separated path segments when calling the Workers AI run endpoint.
