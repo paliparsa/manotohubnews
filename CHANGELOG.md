@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.1 — 2026-10-28
+- Explain why no stories reach AI by tracking previously seen items, duplicate feed items, unique candidates, and the no-candidate reason in diagnostics.
+- Add bounded retries for transient feed HTTP errors (429/500/502/503/504) and temporary fetch failures.
+- Show enabled feed count and zero-AI-candidate explanation in the Telegram run report.
+
+
 ## 1.9.0 — 2026-10-28
 - Add a recoverable review queue with retryable publish failures and retryable admin notifications; failed stories remain persisted instead of disappearing.
 - Retain rejection metadata and source details for 14 days, expose rejected stories in Telegram, record manual admin rejections, and support selective reprocessing under current editorial rules without auto-publishing.
