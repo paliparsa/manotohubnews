@@ -797,6 +797,111 @@ function mainMenuKeyboard() {
   ] };
 }
 
+async function sendCustomTopicsMenu(env: Env, chatId: number | string) {
+  const custom = (await getEditorialTopics(env)).filter(t => t.custom);
+  const rows: Array<Array<{text: string; callback_data: string}>> = custom.map(t => [
+    { text: "✏️ " + t.label.slice(0, 28), callback_data: "topics:edit:" + t.id },
+    { text: "🗑 حذف", callback_data: "topics:delete:" + t.id }
+  ]);
+  rows.push([{ text: "➕ افزودن حوزه", callback_data: "topics:add" }]);
+  rows.push([{ text: "⬅️ تنظیمات تحریریه", callback_data: "menu:editorial" }]);
+  await telegramReply(env, chatId, "<b>🛠 مدیریت حوزه‌های سفارشی</b>\n\nتعداد: " + custom.length + " از ۴۰\nحوزه‌های پیش‌فرض قابل حذف نیستند؛ می‌توانی آن‌ها را در صفحهٔ تحریریه خاموش کنی. حوزه‌های سفارشی اینجا قابل ویرایش و حذف‌اند.\n\n" + (custom.map(t => "• " + escapeHtml(t.label) + " — " + escapeHtml(t.hints.slice(0, 8).join("، "))).join("\n") || "هنوز حوزهٔ سفارشی نداری."), { inline_keyboard: rows });
+}
+
+async function saveCustomTopicFromMessage(env: Env, chatId: number | string, fromId: string, raw: string, editing: boolean) {
+  const parts = raw.split("|");
+  const label = (parts[0] || "").trim().slice(0, 60);
+  const hints = parseKeywordList(parts.slice(1).join("|") || label).slice(0, 20);
+  if (label.length < 2 || label.startsWith("/")) { await telegramReply(env, chatId, "نام حوزه باید حداقل ۲ نویسه باشد. دوباره بفرست یا /cancel کن."); return; }
+  const all = await getEditorialTopics(env);
+  const custom = all.filter(t => t.custom);
+  const id = editing ? ((await stateGet(env, "telegram:topic_edit_id:" + fromId)) || "") : "";
+  if (editing && !custom.some(t => t.id === id)) { await telegramReply(env, chatId, "حوزه برای ویرایش پیدا نشد؛ دوباره از مدیریت حوزه‌ها شروع کن."); return; }
+  if (custom.some(t => t.id !== id && normalizeFilterText(t.label) === normalizeFilterText(label))) { await telegramReply(env, chatId, "حوزه‌ای با این نام از قبل وجود دارد."); return; }
+  if (!editing && custom.length >= 40) { await telegramReply(env, chatId, "حداکثر ۴۰ حوزهٔ سفارشی می‌توانی داشته باشی."); return; }
+  const topicId = editing ? id : "custom_" + simpleHash(label + "|" + Date.now()).slice(0, 8);
+  const topic: EditorialTopic = { id: topicId, label, hints: hints.length ? hints : [normalizeFilterText(label)], custom: true };
+  const next = editing ? custom.map(t => t.id === id ? topic : t) : [...custom, topic];
+  await saveCustomTopics(env, next);
+  if (!editing) {
+    const settings = await getEditorialSettings(env);
+    settings.topics = [...new Set([...settings.topics, topicId])];
+    await statePutPermanent(env, "config:editorial_topics", JSON.stringify(settings.topics));
+  }
+  const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
+  for (const key of ["telegram:awaiting_topic_add:", "telegram:awaiting_topic_edit:", "telegram:topic_edit_id:"]) await stateCall(stub, { op: "delete", key: key + fromId });
+  await bumpFilterRevision(env);
+  await telegramReply(env, chatId, "✅ حوزهٔ «" + escapeHtml(label) + "» " + (editing ? "ویرایش" : "اضافه و فعال") + " شد. کلمات کلیدی: " + escapeHtml(topic.hints.join("، ")), { inline_keyboard: [[{ text: "🎛 تنظیمات تحریریه", callback_data: "menu:editorial" }], [{ text: "🛠 مدیریت حوزه‌ها", callback_data: "topics:manage" }]] });
+}
+
+async function searchTopicAndSendCandidates(env: Env, chatId: number | string, query: string): Promise<void> {
+  const topic = query.trim().slice(0, 220);
+  if (topic.length < 2 || topic.startsWith("/")) { await telegramReply(env, chatId, "موضوع خیلی کوتاه یا نامعتبر است؛ دوباره از دکمهٔ جست‌وجو شروع کن."); return; }
+  const key = await getOpenRouterKey(env);
+  if (!key) { await telegramReply(env, chatId, "اول از منوی اصلی کلید OpenRouter را ثبت کن.", mainMenuKeyboard()); return; }
+  await telegramReply(env, chatId, "⏳ دارم خبرهای تازه دربارهٔ «" + escapeHtml(topic) + "» را پیدا و با هوش مصنوعی بررسی می‌کنم. چند لحظه صبر کن…");
+  try {
+    const q = encodeURIComponent(topic);
+    const urls = [
+      "https://news.google.com/rss/search?q=" + q + "&hl=fa&gl=IR&ceid=IR:fa",
+      "https://news.google.com/rss/search?q=" + q + "&hl=en-US&gl=US&ceid=US:en"
+    ];
+    const results = await Promise.allSettled(urls.map(async (url, i) => {
+      const response = await fetch(url, { headers: { "user-agent": "ManotohubirNewsBot/1.0 (RSS reader)", accept: "application/rss+xml, application/xml, text/xml" }, signal: AbortSignal.timeout(12000) });
+      if (!response.ok) throw new Error("Google News RSS HTTP " + response.status);
+      return parseFeed(await response.text(), i === 0 ? "fa" : "en");
+    }));
+    const items = results.flatMap(r => r.status === "fulfilled" ? r.value : [])
+      .filter(item => !item.publishedAt || Date.now() - Date.parse(item.publishedAt) < 7 * 86400000)
+      .reduce((arr: NewsItem[], item) => { if (!arr.some(x => normalizeTitle(x.title) === normalizeTitle(item.title) || normalizeUrl(x.url) === normalizeUrl(item.url))) arr.push(item); return arr; }, [])
+      .slice(0, 24);
+    if (!items.length) { await telegramReply(env, chatId, "خبر تازه‌ای برای این موضوع پیدا نکردم. موضوع را دقیق‌تر یا با واژه‌های انگلیسی هم امتحان کن.", mainMenuKeyboard()); return; }
+    const order = await getModelOrder(env);
+    const models = [...new Set([...order, ...MODEL_CATALOG.map(m => m.id)])];
+    const payload = items.map(({id,title,url,source,domain,publishedAt,snippet,feedLanguage}) => ({id,title,url,source,domain,publishedAt,snippet,feedLanguage}));
+    const prompt = "کاربر این موضوع خبری را خواسته: " + topic + "\nاز ورودی‌های RSS زیر حداکثر 5 رویداد مرتبط را به فارسی خلاصه کن، خبرهای یک رویداد را ادغام کن، تاریخ/جزئیات نساز و برای ادعاها منبع بده. اگر فقط یک منبع داری آن را «گزارش اولیه» بنام؛ وضعیت را قطعی جلوه نده. خروجی فقط JSON array با فیلدهای relevant,headline,summary,status,confidence,supportingIds,reason,category,topic باشد. supportingIds فقط از شناسه‌های ورودی انتخاب شود.\n" + JSON.stringify(payload);
+    const errors: string[] = [];
+    let posts: AiPost[] | null = null;
+    for (const model of models) {
+      try {
+        const response = await fetch("https://openrouter.ai/api/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", "authorization": "Bearer " + key, "http-referer": "https://manotohubir-news.workers.dev", "x-title": "Manotohubir News" }, body: JSON.stringify({ model, messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: prompt }], temperature: 0.15, max_tokens: 5000 }), signal: AbortSignal.timeout(60000) });
+        const raw = await response.text();
+        if (!response.ok) { errors.push(model + ": HTTP " + response.status); continue; }
+        const data: any = JSON.parse(raw);
+        const content = String(data?.choices?.[0]?.message?.content || "").trim();
+        if (!content) { errors.push(model + ": empty"); continue; }
+        const parsed = parseJsonArray(content);
+        const validIds = new Set(items.map(x => x.id));
+        posts = parsed.map((p: any) => ({
+          relevant: p.relevant !== false, headline: String(p.headline || "").slice(0,180), summary: String(p.summary || "").slice(0,1400),
+          status: ["تأییدشده","گزارش اولیه","در حال بررسی"].includes(p.status) ? p.status : "گزارش اولیه",
+          confidence: Math.max(0, Math.min(1, Number(p.confidence) || 0.5)),
+          supportingIds: Array.isArray(p.supportingIds) ? p.supportingIds.map(String).filter((id: string) => validIds.has(id)) : [],
+          reason: String(p.reason || "").slice(0,240), category: topic.slice(0,80), topic: "manual_search"
+        } as AiPost)).filter(p => p.relevant && p.headline && p.summary && p.supportingIds.length > 0).slice(0,5);
+        await statePut(env, "status:last_model", model, 60 * 60 * 24 * 14);
+        break;
+      } catch (e) { errors.push(model + ": " + (e instanceof Error ? e.message.slice(0,90) : "error")); }
+    }
+    if (!posts) throw new Error("مدل‌ها پاسخ ندادند: " + errors.join(" | ").slice(0,300));
+    if (!posts.length) { await telegramReply(env, chatId, "AI خبر قابل اتکایی از نتایج پیدا نکرد. موضوع را دقیق‌تر امتحان کن.", mainMenuKeyboard()); return; }
+    for (const post of posts) {
+      const supporting = items.filter(x => post.supportingIds.includes(x.id)).slice(0,4);
+      const sourceLines = supporting.map(x => "• <a href=\"" + escapeAttr(x.url) + "\">" + escapeHtml(x.source || x.domain) + "</a>").join("\n");
+      const publishedAt = new Date().toLocaleString("fa-IR", { timeZone: "Asia/Tehran", dateStyle: "medium", timeStyle: "short" });
+      const statusLine = supporting.length >= 2 ? "🔎 <b>چند منبع؛ نیازمند بررسی</b>" : "⚠️ <b>گزارش اولیه؛ یک منبع</b>";
+      const message = "📰 <b>" + escapeHtml(post.headline) + "</b>\n\n" + escapeHtml(post.summary) + "\n\n" + statusLine + "\n🏷️ <b>موضوع جست‌وجو:</b> " + escapeHtml(topic) + "\n\n<b>منابع:</b>\n" + sourceLines + "\n\n🕒 <b>زمان بررسی:</b> " + escapeHtml(publishedAt) + " (تهران)\n@Manotohubir";
+      const postKey = await hashKey("manual|" + normalizeTitle(post.headline) + "|" + supporting.map(x=>normalizeUrl(x.url)).join("|"));
+      await statePutPermanent(env, "pending:" + postKey, JSON.stringify({ postKey, message, headline: post.headline, createdAt: new Date().toISOString(), supporting: supporting.map(x=>x.url), manualSearch: true }));
+      await telegramReply(env, chatId, message, { inline_keyboard: [[{ text: "📣 خوشم اومد؛ انتشار در کانال", callback_data: "publish:" + postKey }, { text: "🗑 رد خبر", callback_data: "skip:" + postKey }]] });
+    }
+    await telegramReply(env, chatId, "تمام شد. فقط خبرهایی که دکمهٔ «خوشم اومد؛ انتشار در کانال» را بزنی منتشر می‌شوند.", mainMenuKeyboard());
+  } catch (error) {
+    console.error("manual_topic_search_failed", error instanceof Error ? error.message : String(error));
+    await telegramReply(env, chatId, "❌ جست‌وجو کامل نشد: " + escapeHtml(error instanceof Error ? error.message.slice(0,220) : "خطای نامشخص"), mainMenuKeyboard());
+  }
+}
+
 async function sendSourcesMenu(env: Env, chatId: number | string, page = 0) {
   const sources = await getFeedSources(env);
   const pageSize = 8;
@@ -894,9 +999,52 @@ async function handleAdminCallback(env: Env, query: any) {
   if (data === "menu:sources") { await sendSourcesMenu(env, chatId); return; }
   if (data === "menu:editorial") { await editorialMenu(env, chatId); return; }
   if (data === "menu:diagnostics") { await sendDiagnostics(env, chatId); return; }
+  if (data === "topics:add") {
+    await statePut(env, "telegram:awaiting_topic_add:" + fromId, "1", 600);
+    await telegramReply(env, chatId, "➕ <b>افزودن حوزهٔ خبری</b>\n\nنام حوزه را بفرست؛ می‌توانی بعد از علامت | کلمات کلیدی فارسی/انگلیسی را هم اضافه کنی.\nمثال: <code>بازی‌های ویدیویی | بازی، گیم، gaming، PlayStation، Xbox</code>\n\nبرای لغو /cancel را بفرست.");
+    return;
+  }
+  if (data === "topics:manage") { await sendCustomTopicsMenu(env, chatId); return; }
+  if (data.startsWith("topics:delete:")) {
+    const id = data.slice("topics:delete:".length);
+    const topic = (await getEditorialTopics(env)).find(t => t.id === id && t.custom);
+    if (!topic) { await telegramReply(env, chatId, "حوزهٔ سفارشی پیدا نشد."); return; }
+    await statePut(env, "telegram:pending_topic_delete:" + fromId, id, 600);
+    await telegramReply(env, chatId, "⚠️ <b>حذف حوزهٔ «" + escapeHtml(topic.label) + "»؟</b>\nاین حوزه از تنظیمات تحریریه حذف می‌شود. منابع خبری و خبرهای منتشرشده دست‌نخورده می‌مانند.", { inline_keyboard: [[{ text: "🗑 بله، حذف کن", callback_data: "topics:confirmdelete:" + id }], [{ text: "لغو", callback_data: "topics:manage" }]] });
+    return;
+  }
+  if (data.startsWith("topics:confirmdelete:")) {
+    const id = data.slice("topics:confirmdelete:".length);
+    if (await stateGet(env, "telegram:pending_topic_delete:" + fromId) !== id) { await telegramReply(env, chatId, "درخواست حذف منقضی شده؛ دوباره تلاش کن."); return; }
+    const all = await getEditorialTopics(env);
+    const custom = all.filter(t => t.custom && t.id !== id);
+    if (custom.length === all.filter(t => t.custom).length) { await telegramReply(env, chatId, "حوزه پیدا نشد."); return; }
+    await saveCustomTopics(env, custom);
+    const settings = await getEditorialSettings(env);
+    settings.topics = settings.topics.filter(x => x !== id);
+    await statePutPermanent(env, "config:editorial_topics", JSON.stringify(settings.topics));
+    await bumpFilterRevision(env);
+    await stateCall(env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global")), { op: "delete", key: "telegram:pending_topic_delete:" + fromId });
+    await sendCustomTopicsMenu(env, chatId);
+    return;
+  }
+  if (data.startsWith("topics:edit:")) {
+    const id = data.slice("topics:edit:".length);
+    const topic = (await getEditorialTopics(env)).find(t => t.id === id && t.custom);
+    if (!topic) { await telegramReply(env, chatId, "حوزه پیدا نشد."); return; }
+    await statePut(env, "telegram:topic_edit_id:" + fromId, id, 600);
+    await statePut(env, "telegram:awaiting_topic_edit:" + fromId, "1", 600);
+    await telegramReply(env, chatId, "✏️ <b>ویرایش حوزه</b>\n\nنام و کلمات کلیدی را با قالب <code>نام | کلمه۱، کلمه۲</code> بفرست.\nفعلی: <code>" + escapeHtml(topic.label) + " | " + escapeHtml(topic.hints.join("، ")) + "</code>\nبرای لغو /cancel را بفرست.");
+    return;
+  }
+  if (data === "topicsearch:start") {
+    await statePut(env, "telegram:awaiting_topic_search:" + fromId, "1", 600);
+    await telegramReply(env, chatId, "🔎 <b>جست‌وجوی خبر با هوش مصنوعی</b>\n\nموضوع یا سؤال خبری‌ات را بفرست؛ مثلاً: <i>آخرین تحولات هوش مصنوعی در اپل</i> یا <i>وضعیت مذاکرات ایران و آمریکا</i>.\n\nخبرهای تازه را از Google News RSS در فارسی و انگلیسی جمع می‌کنم، با AI خلاصه و خبرهای تکراری را ادغام می‌کنم و نتیجه را برای بررسی خودت می‌فرستم. انتشار در کانال فقط با زدن دکمهٔ تأیید انجام می‌شود.\n\nبرای لغو /cancel را بفرست.");
+    return;
+  }
   if (data.startsWith("editorial:topic:")) {
     const id = data.slice("editorial:topic:".length);
-    if (!EDITORIAL_TOPICS.some(t => t.id === id)) { await telegramReply(env, chatId, "حوزه نامعتبر است."); return; }
+    if (!(await getEditorialTopics(env)).some(t => t.id === id)) { await telegramReply(env, chatId, "حوزه نامعتبر است."); return; }
     const settings = await getEditorialSettings(env);
     settings.topics = settings.topics.includes(id) ? settings.topics.filter(x => x !== id) : [...settings.topics, id];
     await statePutPermanent(env, "config:editorial_topics", JSON.stringify(settings.topics));
