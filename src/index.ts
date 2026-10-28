@@ -982,22 +982,21 @@ async function addFeedSourceFromMessage(env: Env, chatId: number | string, fromI
   await sendSourcesMenu(env, chatId);
 }
 
-async function getPublicationSettings(env: Env): Promise<{enabled: boolean; mode: "auto" | "approval"}> {
+type PublishingMode = "auto" | "approval" | "save_only" | "paused";
+async function getPublicationSettings(env: Env): Promise<{enabled: boolean; mode: PublishingMode}> {
   const [enabledRaw, modeRaw] = await Promise.all([stateGet(env, "config:publishing_enabled"), stateGet(env, "config:publishing_mode")]);
-  return { enabled: enabledRaw !== "false", mode: modeRaw === "approval" ? "approval" : "auto" };
+  const mode: PublishingMode = ["auto","approval","save_only","paused"].includes(modeRaw || "") ? modeRaw as PublishingMode : "auto";
+  return { enabled: enabledRaw !== "false", mode };
 }
-function publishingKeyboard(settings: {enabled: boolean; mode: "auto" | "approval"}) {
-  return { inline_keyboard: [
-    [{ text: settings.enabled ? "🟢 انتشار روشن است — خاموش کن" : "🔴 انتشار خاموش است — روشن کن", callback_data: "publishing:toggle" }],
-    [{ text: settings.mode === "auto" ? "✅ انتشار خودکار (تغییر به تأیید)" : "📝 تأیید قبل از انتشار (تغییر به خودکار)", callback_data: "publishing:mode" }],
-    [{ text: "⬅️ منوی اصلی", callback_data: "menu:home" }]
-  ] };
+function publishingKeyboard(settings: {enabled: boolean; mode: PublishingMode}) {
+  const modes: Array<{id:PublishingMode;label:string}> = [{id:"auto",label:"🤖 انتشار مستقیم"},{id:"approval",label:"📝 تأیید ادمین"},{id:"save_only",label:"💾 فقط ذخیره خبر"},{id:"paused",label:"⏸ توقف موقت انتشار"}];
+  return { inline_keyboard: [...modes.map(m => [{text:(settings.mode===m.id && settings.enabled ? "✅ " : "")+m.label,callback_data:"publishing:set:"+m.id}]), [{text:"⬅️ منوی اصلی",callback_data:"menu:home"}]] };
 }
 async function sendPublishingSettings(env: Env, chatId: number | string) {
   const settings = await getPublicationSettings(env);
-  const stateText = settings.enabled ? "🟢 <b>انتشار روشن است</b>" : "🔴 <b>انتشار خاموش است</b>";
-  const modeText = settings.mode === "auto" ? "🤖 حالت: انتشار خودکار" : "📝 حالت: اول تأیید مدیر";
-  await telegramReply(env, chatId, `<b>📣 تنظیمات انتشار خبر</b>\n\n${stateText}\n${modeText}\n\nوقتی انتشار خاموش باشد، خبرهای آماده به‌صورت پیش‌نویس برایت ارسال می‌شوند و در کانال منتشر نمی‌شوند مگر اینکه خودت تأییدشان کنی.`, publishingKeyboard(settings));
+  const labels: Record<PublishingMode,string> = {auto:"انتشار مستقیم",approval:"تأیید ادمین پیش از انتشار",save_only:"فقط ذخیره خبر بدون انتشار خودکار",paused:"توقف موقت انتشار"};
+  const descriptions: Record<PublishingMode,string> = {auto:"خبرهای واجد شرایط مستقیم در کانال منتشر می‌شوند.",approval:"هر خبر پیش از انتشار به صف تأیید تو می‌رود.",save_only:"خبرها آماده و در صف ذخیره می‌شوند؛ انتشار خودکار ندارند و می‌توانی بعداً دستی بررسی‌شان کنی.",paused:"جمع‌آوری و آماده‌سازی ادامه دارد؛ انتشار متوقف است و خبرهای آماده در صف قابل‌بازیابی ذخیره می‌شوند."};
+  await telegramReply(env, chatId, "<b>📣 سیاست انتشار خبر</b>\n\nحالت فعلی: <b>"+labels[settings.mode]+"</b>\n\n"+descriptions[settings.mode]+"\n\nاین تنظیم مستقل از فیلتر موضوعات است؛ توقف انتشار، جمع‌آوری و آماده‌سازی را متوقف نمی‌کند.", publishingKeyboard(settings));
 }
 function modelsKeyboard(order: string[]) {
   const rows: Array<Array<{text: string; callback_data: string}>> = order.map((id, i) => [{ text: (i === 0 ? "✅ " : "") + (i + 1) + ". " + (MODEL_CATALOG.find(m => m.id === id)?.name || id), callback_data: "model:" + i }]);
@@ -1118,8 +1117,9 @@ async function handleAdminCallback(env: Env, query: any) {
     return;
   }
   if (data === "menu:publishing") { await sendPublishingSettings(env, chatId); return; }
-  if (data === "publishing:toggle") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_enabled", current.enabled ? "false" : "true"); await sendPublishingSettings(env, chatId); return; }
-  if (data === "publishing:mode") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_mode", current.mode === "auto" ? "approval" : "auto"); await sendPublishingSettings(env, chatId); return; }
+  if (data === "publishing:toggle") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_mode", current.mode === "paused" ? "auto" : "paused"); await statePutPermanent(env, "config:publishing_enabled", "true"); await sendPublishingSettings(env, chatId); return; }
+  if (data === "publishing:mode") { const current = await getPublicationSettings(env); await statePutPermanent(env, "config:publishing_mode", current.mode === "auto" ? "approval" : "auto"); await statePutPermanent(env, "config:publishing_enabled", "true"); await sendPublishingSettings(env, chatId); return; }
+  if (data.startsWith("publishing:set:")) { const mode = data.slice("publishing:set:".length); if (!(["auto","approval","save_only","paused"] as string[]).includes(mode)) { await telegramReply(env,chatId,"سیاست انتشار نامعتبر است."); return; } await statePutPermanent(env,"config:publishing_mode",mode); await statePutPermanent(env,"config:publishing_enabled","true"); await sendPublishingSettings(env,chatId); return; }
   if (data.startsWith("publish:") || data.startsWith("skip:")) {
     const approve = data.startsWith("publish:");
     const postKey = data.slice(approve ? 8 : 5);
