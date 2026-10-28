@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.16.0 — 2026-10-28
+- Align the default maximum news age with the RSS discovery window (7 days) instead of silently dropping relevant reports after 24 hours.
+- Migrate the legacy 6h/24h default to 168h once, preserve explicit 72h/336h/unlimited settings, and bump the filter revision so previously age-rejected stories can be reconsidered.
+- Expand priority-news detection for US military and Gulf-region security reporting in English, Persian, Hebrew, and Arabic, so relevant regional stories bypass the age filter.
+- Add the underlying pipeline error to the admin health report when AI returns zero items, making model failures diagnosable from Telegram.
+
+
 ## 1.15.0 — 2026-10-28
 - Stop advertising retired MiniMax M3.1 Flash `:free`; when OpenRouter's live catalog is available, use it as authoritative instead of permanently merging stale fallback IDs.
 - Exclude NVIDIA-hosted models from the free-model catalog and curation attempts after repeated empty-output failures in connection tests; the explicitly excluded Nemotron 3 Ultra remains excluded.
