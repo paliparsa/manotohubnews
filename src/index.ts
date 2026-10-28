@@ -58,10 +58,18 @@ const SYSTEM_PROMPT = `تو دبیر خبر یک کانال خبری فارسی�
 
 export default {
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    // Telegram updates arrive instantly through the webhook; Cron is only for news publishing.
-    const minute = new Date(controller.scheduledTime).getUTCMinutes();
-    // RSS discovery and free-tier model curation are the only scheduled news path.
-    // Paid Exa web search remains available only through an explicit admin/manual action.
+    // Cron is the actual five-minute RSS ingestion + AI curation + publication trigger.
+    // Await the pipeline so the scheduled event remains alive until it has finished.
+    console.log("cron_pipeline_started", JSON.stringify({
+      scheduledTime: new Date(controller.scheduledTime).toISOString()
+    }));
+    try {
+      const result = await runPipeline(env, "cron");
+      console.log("cron_pipeline_finished", JSON.stringify(result));
+    } catch (error) {
+      console.error("cron_pipeline_unhandled_error", error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   },
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
@@ -667,7 +675,7 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
   const allTopics = await getEditorialTopics(env);
   const activeTopics = allTopics.filter(t => editorial.topics.includes(t.id));
   const prompt = [
-    "این فهرست خبرها را با پوشش گسترده بررسی کن و حداکثر 12 رویداد مرتبط را به فارسی برگردان.",
+    "این فهرست خبرها را بررسی کن و حداکثر 8 رویداد مرتبط را به فارسی برگردان. برای هر خبر تیتر فارسی کامل و خلاصه فارسی 2 تا 4 جمله‌ای بنویس؛ متن ناقص یا انگلیسی تحویل نده.",
     "اولویت اصلی: ایران، جمهوری اسلامی، شاهزاده رضا پهلوی و تیم/ائتلاف او، اسرائیل، رابطه و تنش ایران-اسرائیل-آمریکا، جنگ و حملات، مذاکرات، تحریم‌ها و پیامدهای امنیتی/سیاسی مرتبط.",
     "حوزه‌های فعال، حساسیت، فهرست کلمات مجاز/ممنوع و محدودیت موضوعی را به‌عنوان مانع رد خبر اعمال نکن؛ خبر مرتبط با اولویت‌های بالا را نگه دار.",
     "برای هر خبر topic را از شناسه‌های موجود انتخاب کن؛ اگر دقیق نبود iran یا war را انتخاب کن. خبر مرتبط را صرفاً به خاطر موضوع فرعی یا confidence پایین حذف نکن.",
@@ -676,7 +684,7 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
     JSON.stringify(payload)
   ].join("\n");
   const errors: string[] = [];
-  for (const model of models) {
+  for (const model of models.slice(0, 3)) {
     try {
       const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
@@ -685,9 +693,9 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
           model,
           messages: [{ role: "system", content: SYSTEM_PROMPT }, { role: "user", content: prompt }],
           temperature: 0.15,
-          max_tokens: 7000
+          max_tokens: 6000
         }),
-        signal: AbortSignal.timeout(90000)
+        signal: AbortSignal.timeout(25000)
       });
       const bodyText = await response.text();
       if (!response.ok) { errors.push(`${model}: HTTP ${response.status}`); continue; }
@@ -696,6 +704,15 @@ async function curateWithOpenRouter(items: NewsItem[], env: Env): Promise<AiPost
       if (!text) { errors.push(`${model}: empty response`); continue; }
       const parsed = parseJsonArray(text);
       if (!Array.isArray(parsed)) { errors.push(`${model}: invalid JSON array`); continue; }
+      if (parsed.length === 0) { errors.push(`${model}: empty news array`); continue; }
+      const malformedRelevant = parsed.some((p: any) => p?.relevant === true &&
+        (typeof p.headline !== "string" || !p.headline.trim() ||
+         typeof p.summary !== "string" || !p.summary.trim() ||
+         !Array.isArray(p.supportingIds) || p.supportingIds.length === 0));
+      if (malformedRelevant) {
+        errors.push(`${model}: incomplete Persian headline/summary or missing source IDs`);
+        continue;
+      }
       const validIds = new Set(items.map(x => x.id));
       await statePut(env, "status:last_model", model, 60 * 60 * 24 * 14);
       return parsed.map((p: any) => ({
