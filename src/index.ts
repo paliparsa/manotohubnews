@@ -301,7 +301,7 @@ async function stateCall(stub: DurableObjectStub, body: Record<string, unknown>)
 }
 async function stateList(env: Env, prefix: string, limit = 30): Promise<Array<{key:string;value:string}>> {
   const stub = env.NEWS_STATE.get(env.NEWS_STATE.idFromName("manotohubir-global"));
-  const result = await stateCall(stub, { op: "list", prefix, limit });
+  const result = await stateCall(stub, { op: "list", key: prefix, prefix, limit });
   return Array.isArray(result.entries) ? result.entries.filter((x:any)=>x && typeof x.key === "string" && typeof x.value === "string") : [];
 }
 async function stateGet(env: Env, key: string): Promise<string | null> {
